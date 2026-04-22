@@ -1,0 +1,40 @@
+[[profiles]]
+name = "example"
+
+[profiles.target]
+host = "target.internal"
+user = "root"
+port = 22
+
+[[profiles.bastions]]
+host = "bastion.example.com"
+user = "root"
+port = 22
+
+[profiles.target.auth]
+type = "password"
+password = "target-password"
+
+[profiles.bastions.auth]
+type = "key"
+key_path = "~/.ssh/id_ed25519"
+
+[profiles.remote]
+shell = "bash -lc"
+
+[profiles.agent]
+manage = true
+remote_path = "/tmp/ssh-gatewayd"
+version = "0.1.0"
+
+[profiles.bootstrap]
+enabled = true
+remote_temp_dir = "/tmp"
+
+[profiles.timeouts]
+exec_seconds = 600
+idle_session_seconds = 900
+
+[profiles.keepalive]
+interval_seconds = 30
+count_max = 3

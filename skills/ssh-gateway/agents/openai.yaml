@@ -1,0 +1,4 @@
+interface:
+  display_name: "SSH Gateway"
+  short_description: "Operate remote Linux hosts through local ssh-gateway profiles"
+  default_prompt: "Use $ssh-gateway to perform profile-driven remote operations through the local ssh-gateway CLI."

@@ -1,0 +1,56 @@
+# Preferred YAML config format.
+# This file shows both supported transport styles:
+# 1. direct SSH with gateway-managed bastion auth
+# 2. delegated via_profile reuse
+
+profiles:
+  - name: direct-with-bastion
+    target:
+      host: target.internal
+      user: root
+      port: 22
+      auth:
+        type: password
+        password: target-password
+    bastions:
+      - host: bastion.example.com
+        user: root
+        port: 22
+        auth:
+          type: key
+          key_path: ~/.ssh/id_ed25519
+    remote:
+      shell: bash -lc
+    agent:
+      manage: true
+      remote_path: /tmp/ssh-gatewayd
+      version: 0.1.0
+    bootstrap:
+      enabled: true
+      remote_temp_dir: /tmp
+    timeouts:
+      exec_seconds: 600
+      idle_session_seconds: 900
+    keepalive:
+      interval_seconds: 30
+      count_max: 3
+
+  - name: upstream-bastion
+    target:
+      host: bastion.example.com
+      user: root
+      port: 22
+      auth:
+        type: key
+        key_path: ~/.ssh/id_ed25519
+    remote:
+      shell: bash -lc
+
+  - name: delegated-target
+    via_profile: upstream-bastion
+    target:
+      host: target.internal
+      user: root
+      port: 22
+    remote:
+      shell: bash -lc
