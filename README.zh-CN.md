@@ -216,7 +216,27 @@ ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.
 
 ## 作为 Skill 安装给智能体
 
-仓库内置了一个 Codex 风格 skill，目录在 [skills/ssh-gateway](skills/ssh-gateway)。它的职责不是替代 CLI，而是指导 agent 优先走 profile 驱动的 `ssh-gateway` 命令，而不是回退到原始 `ssh`。
+仓库内置了一个可移植的 `SKILL.md` 风格 skill，目录在 [skills/ssh-gateway](skills/ssh-gateway)。它面向支持开放 skills 生态的智能体，职责不是替代 CLI，而是指导 agent 优先走 profile 驱动的 `ssh-gateway` 命令，而不是回退到原始 `ssh`。
+
+### 开放 skills 生态安装
+
+如果目标 agent 支持 [`npx skills add`](https://github.com/vercel-labs/skills)，可以直接从这个仓库安装：
+
+```bash
+npx skills add TYzzt/ssh-gateway --skill ssh-gateway
+```
+
+常见 agent 示例：
+
+```bash
+npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a codex -g
+npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a claude-code -g
+npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a cursor -g
+```
+
+### Codex 原生安装方式
+
+如果你更想走 Codex 自带的 skill 安装器，也可以直接从 GitHub 安装：
 
 Windows PowerShell：
 
@@ -236,9 +256,10 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 
 说明：
 
-- 安装完成后需要重启 Codex。
+- 安装完成后需要重启对应的 agent。
 - 这个 skill 预期本地已经有 `ssh-gateway` 二进制和可用配置文件。
 - skill 很薄，只负责规范 agent 应该如何调用本项目 CLI。
+- 如果目标不是 Codex，优先用 `npx skills add` 这条路径更通用。
 
 ## Release 自动化概览
 
