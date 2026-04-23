@@ -1,5 +1,16 @@
 # ssh-gateway CLI Usage
 
+## Binary bootstrap
+
+If `ssh-gateway` is missing, install it before doing any remote action:
+
+```text
+powershell -ExecutionPolicy Bypass -File <skill-dir>/scripts/install.ps1
+bash <skill-dir>/scripts/install.sh
+```
+
+The install scripts download the latest GitHub Release by default and print a JSON object containing the resolved binary path.
+
 ## Preflight
 
 Use these checks before any remote action:
@@ -26,6 +37,7 @@ ssh-gateway session inspect --id <session-id>
 
 ## Failure handling
 
+- `ssh-gateway` command not found: run the bundled install script for the current platform, then retry with the installed binary path.
 - `daemon_unavailable`: the daemon is not listening; retry through a normal command or start the daemon explicitly.
 - `config_error`: the profile or auth configuration is invalid; fix the config instead of bypassing the gateway.
 - `ssh_error`: SSH transport or remote auth failed; inspect the target profile and bastion chain.

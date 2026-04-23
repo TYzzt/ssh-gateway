@@ -218,6 +218,8 @@ Typical install flow:
 
 The repository includes a portable `SKILL.md`-based skill at [skills/ssh-gateway](skills/ssh-gateway). The skill is meant for agents that support the open skills ecosystem and teaches them to prefer profile-driven `ssh-gateway` commands over raw `ssh`.
 
+The skill can also bootstrap the `ssh-gateway` binary on first use by downloading the latest GitHub Release for the current platform.
+
 ### Open skills ecosystem
 
 If your agent supports [`npx skills add`](https://github.com/vercel-labs/skills), install the skill directly from this repository:
@@ -257,7 +259,8 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 Notes:
 
 - Restart your agent after installing the skill.
-- The skill expects a local `ssh-gateway` binary and a valid config file to already exist.
+- If `ssh-gateway` is missing, the bundled skill scripts can download the latest release binary on first use.
+- The skill still expects a valid config file to already exist.
 - The skill is intentionally thin: it does not replace the CLI, it standardizes how the agent should call it.
 - `npx skills add` is the most portable option when the target agent is not Codex.
 
