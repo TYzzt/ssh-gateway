@@ -240,19 +240,41 @@ ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.
 
 ### 开放 skills 生态安装
 
-如果目标 agent 支持 [`npx skills add`](https://github.com/vercel-labs/skills)，可以直接从这个仓库安装：
+如果目标 agent 支持 [`npx skills add`](https://github.com/vercel-labs/skills)，更推荐直接指向 skill 目录对应的 GitHub 路径安装。这样可以避开部分 agent 或 CLI 版本在“从仓库根发现嵌套 skill”时的不稳定行为：
 
 ```bash
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -g
+```
+
+如果 CLI 对嵌套 skill 的发现正常，仓库简写也可以用：
+
+```bash
+npx skills add TYzzt/ssh-gateway --skill ssh-gateway -g
 ```
 
 常见 agent 示例：
 
 ```bash
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a codex -g
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a claude-code -g
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a cursor -g
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a codex -g
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a claude-code -g
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a cursor -g
 ```
+
+如果你想先确认 CLI 实际看到了哪些 skill：
+
+```bash
+npx skills add TYzzt/ssh-gateway --list
+```
+
+如果这份 skill 最初就是通过 `npx skills add` 安装的，后续更新可以直接走：
+
+```bash
+npx skills update ssh-gateway -g
+```
+
+`npx skills update` 不会接管通过 Codex 原生 `install-skill-from-github.py` 装出来的副本。如果你之前是那条路径安装的，又想以后走标准的 `skills` CLI 更新流程，做法是先删掉旧副本，再改用 `npx skills add` 重新安装。
+
+安装并不依赖某个强制的统一中心仓库。这个 GitHub 仓库本身就可以直接作为分发源；[skills.sh](https://skills.sh/docs) 更像发现入口和公开排行榜，而不是必须先注册才能安装的中心仓库。
 
 ### Codex 原生安装方式
 
@@ -280,7 +302,7 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 - 如果本地还没有 `ssh-gateway`，skill 自带的脚本可以在首次使用时下载最新 release 二进制。
 - 这个 skill 仍然预期本地已经有可用配置文件。
 - skill 很薄，只负责规范 agent 应该如何调用本项目 CLI。
-- 如果目标不是 Codex，优先用 `npx skills add` 这条路径更通用。
+- 如果你希望跨 agent 统一安装和更新流程，优先用 `npx skills add`。
 - 如果 profile 使用了带口令私钥，把口令留在 gateway 配置里，不要粘贴到对话或命令行参数里。
 
 ## Release 自动化概览

@@ -240,19 +240,41 @@ The skill can also bootstrap the `ssh-gateway` binary on first use by downloadin
 
 ### Open skills ecosystem
 
-If your agent supports [`npx skills add`](https://github.com/vercel-labs/skills), install the skill directly from this repository:
+If your agent supports [`npx skills add`](https://github.com/vercel-labs/skills), prefer installing from the direct GitHub path to the skill directory. This avoids repository-root discovery ambiguity on agents or CLI versions that do not consistently resolve nested skills:
 
 ```bash
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -g
+```
+
+Repository shorthand also works when the CLI discovers nested skills correctly:
+
+```bash
+npx skills add TYzzt/ssh-gateway --skill ssh-gateway -g
 ```
 
 Examples for common agents:
 
 ```bash
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a codex -g
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a claude-code -g
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -a cursor -g
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a codex -g
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a claude-code -g
+npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a cursor -g
 ```
+
+To inspect what the CLI sees before installing:
+
+```bash
+npx skills add TYzzt/ssh-gateway --list
+```
+
+To update an existing install that originally came from `npx skills add`:
+
+```bash
+npx skills update ssh-gateway -g
+```
+
+`npx skills update` does not manage copies installed by the Codex-native `install-skill-from-github.py` script. If you previously installed the skill that way, remove the old copy and reinstall it through `npx skills add` if you want standard `skills` CLI updates later.
+
+There is no mandatory central registry for installation. This repository is already a valid distribution source. [skills.sh](https://skills.sh/docs) is useful for discovery and the public leaderboard, but it is not required to install or update this skill.
 
 ### Codex-native installer
 
@@ -280,7 +302,7 @@ Notes:
 - If `ssh-gateway` is missing, the bundled skill scripts can download the latest release binary on first use.
 - The skill still expects a valid config file to already exist.
 - The skill is intentionally thin: it does not replace the CLI, it standardizes how the agent should call it.
-- `npx skills add` is the most portable option when the target agent is not Codex.
+- Prefer `npx skills add` when you want a standard install/update workflow across agents.
 - For passphrase-protected keys, keep the passphrase in the gateway config instead of pasting it into chat or shell flags.
 
 ## Release Workflow Overview
