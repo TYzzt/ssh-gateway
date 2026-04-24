@@ -26,9 +26,12 @@ pub fn endpoint_path() -> Result<PathBuf, ArrtError> {
     Ok(PathBuf::from(WINDOWS_DAEMON_ADDR))
 }
 
-async fn write_frame<T: Serialize, W: AsyncWrite + Unpin>(writer: &mut W, value: &T) -> Result<(), ArrtError> {
-    let payload =
-        serde_json::to_vec(value).map_err(|err| ArrtError::Ipc(format!("serialize request: {err}")))?;
+async fn write_frame<T: Serialize, W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), ArrtError> {
+    let payload = serde_json::to_vec(value)
+        .map_err(|err| ArrtError::Ipc(format!("serialize request: {err}")))?;
     let len = (payload.len() as u32).to_be_bytes();
     writer.write_all(&len).await?;
     writer.write_all(&payload).await?;
@@ -36,7 +39,9 @@ async fn write_frame<T: Serialize, W: AsyncWrite + Unpin>(writer: &mut W, value:
     Ok(())
 }
 
-async fn read_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(reader: &mut R) -> Result<T, ArrtError> {
+async fn read_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<T, ArrtError> {
     let mut len = [0_u8; 4];
     reader.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;

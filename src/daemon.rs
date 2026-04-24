@@ -78,9 +78,11 @@ impl DaemonState {
                 config.validate()?;
                 if let Some(name) = name {
                     let profile = config.profile(&name)?;
-                    Ok(CommandResult::success().with_data(json!({"valid": true, "profile": profile.name })))
+                    Ok(CommandResult::success()
+                        .with_data(json!({"valid": true, "profile": profile.name })))
                 } else {
-                    Ok(CommandResult::success().with_data(json!({"valid": true, "profiles": config.profiles.len()})))
+                    Ok(CommandResult::success()
+                        .with_data(json!({"valid": true, "profiles": config.profiles.len()})))
                 }
             }
             Request::Exec {
@@ -112,7 +114,9 @@ impl DaemonState {
                 let config = AppConfig::load().await?;
                 let mut sessions = self.sessions.lock().await;
                 sessions.reap_idle_sessions(&config).await;
-                sessions.write(&config, &profile, path, mode, content_b64).await
+                sessions
+                    .write(&config, &profile, path, mode, content_b64)
+                    .await
             }
             Request::Upload { profile, src, dst } => {
                 let config = AppConfig::load().await?;

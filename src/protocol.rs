@@ -80,8 +80,12 @@ pub enum Request {
     Ping,
     Shutdown,
     ProfileList,
-    ProfileShow { name: String },
-    ProfileValidate { name: Option<String> },
+    ProfileShow {
+        name: String,
+    },
+    ProfileValidate {
+        name: Option<String>,
+    },
     Exec {
         profile: String,
         command: String,
@@ -145,9 +149,10 @@ mod tests {
 
     #[test]
     fn result_serializes() {
-        let json = CommandResult::success().with_data(json!({"hello":"world"})).to_json();
+        let json = CommandResult::success()
+            .with_data(json!({"hello":"world"}))
+            .to_json();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"hello\":\"world\""));
     }
 }
-

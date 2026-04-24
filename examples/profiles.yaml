@@ -19,12 +19,13 @@ profiles:
         auth:
           type: key
           key_path: ~/.ssh/id_ed25519
+          passphrase: optional-key-passphrase
     remote:
       shell: bash -lc
     agent:
       manage: true
       remote_path: /tmp/ssh-gatewayd
-      version: 0.1.0
+      version: 0.1.1
     bootstrap:
       enabled: true
       remote_temp_dir: /tmp
@@ -43,6 +44,7 @@ profiles:
       auth:
         type: key
         key_path: ~/.ssh/id_ed25519
+        passphrase: optional-key-passphrase
     remote:
       shell: bash -lc
 

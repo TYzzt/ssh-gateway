@@ -33,8 +33,8 @@
 
 ## 特性
 
-- **在 gateway API 边界做 secret isolation**：daemon 从配置文件读取密码和密钥路径；调用方只传 `profile` 和操作参数。
-- **脱敏的 profile / session 输出**：`profile show`、`session inspect`、错误结果都不会回显原始密码。
+- **在 gateway API 边界做 secret isolation**：daemon 从配置文件读取密码、密钥路径和可选的私钥口令；调用方只传 `profile` 和操作参数。
+- **脱敏的 profile / session 输出**：`profile show`、`session inspect`、错误结果都不会回显原始密码或口令。
 - **面向 agent 的 profile-first 工作流**：agent 用 profile 名称工作，而不是拼带密码的 `ssh` 命令。
 - **嵌入式 SSH + 会话复用**：direct / bastion 模式不依赖本地反复起 `ssh.exe` 或 `scp`。
 - **direct / bastion 模式下本地不依赖 OpenSSH**：Windows 和 Linux 的直连传输都走内置 SSH 客户端栈。
@@ -51,8 +51,8 @@
 
 ### 已经隔离的部分
 
-- 密码和私钥路径保存在 `profiles.yaml`、`profiles.yml` 或兼容的 `profiles.toml` 中，由本地 gateway daemon 读取和使用。
-- CLI / RPC 请求只携带 `profile` 名称和操作参数，不携带裸密码或私钥内容。
+- 密码、私钥路径和可选的私钥口令保存在 `profiles.yaml`、`profiles.yml` 或兼容的 `profiles.toml` 中，由本地 gateway daemon 读取和使用。
+- CLI / RPC 请求只携带 `profile` 名称和操作参数，不携带裸密码、口令或私钥内容。
 - `profile show`、`session inspect` 和错误结果会在返回 JSON 之前做脱敏。
 
 ### 不是在承诺什么
@@ -128,6 +128,23 @@ profiles:
         auth:
           type: key
           key_path: ~/.ssh/id_ed25519
+
+### 带口令的私钥
+
+```yaml
+profiles:
+  - name: encrypted-key-target
+    target:
+      host: secure.internal
+      user: ops
+      port: 22
+      auth:
+        type: key
+        key_path: ~/.ssh/id_rsa_2048
+        passphrase: local-key-passphrase
+```
+
+这个口令只会被本地 gateway daemon 用来解密私钥，不会通过 `profile show`、`session inspect` 或普通 CLI 错误结果返回给调用方。
 ```
 
 ### 委托模式 `via_profile`
@@ -172,6 +189,7 @@ user = "root"
 
 [profiles.auth]
 key_path = "~/.ssh/id_ed25519"
+passphrase = "local-key-passphrase"
 ```
 
 ## 命令
@@ -263,6 +281,7 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 - 这个 skill 仍然预期本地已经有可用配置文件。
 - skill 很薄，只负责规范 agent 应该如何调用本项目 CLI。
 - 如果目标不是 Codex，优先用 `npx skills add` 这条路径更通用。
+- 如果 profile 使用了带口令私钥，把口令留在 gateway 配置里，不要粘贴到对话或命令行参数里。
 
 ## Release 自动化概览
 
@@ -276,8 +295,8 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 示例：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## 许可证

@@ -56,6 +56,8 @@ pub struct AuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 }
 
@@ -143,8 +145,13 @@ pub struct DelegatedEndpoint {
 
 #[derive(Debug, Clone)]
 pub enum ResolvedAuthConfig {
-    Key { key_path: PathBuf },
-    Password { password: String },
+    Key {
+        key_path: PathBuf,
+        passphrase: Option<String>,
+    },
+    Password {
+        password: String,
+    },
 }
 
 fn default_port() -> u16 {
@@ -239,9 +246,9 @@ impl Default for KeepaliveConfig {
 impl AppConfig {
     pub async fn load() -> Result<Self, ArrtError> {
         let path = config_path()?;
-        let raw = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|err| ArrtError::Config(format!("failed to read {}: {}", path.display(), err)))?;
+        let raw = tokio::fs::read_to_string(&path).await.map_err(|err| {
+            ArrtError::Config(format!("failed to read {}: {}", path.display(), err))
+        })?;
         let mut config = parse_config(&raw, &path)?;
         config.source_path = path;
         config.validate()?;
@@ -357,11 +364,16 @@ impl Profile {
             let _ = config.resolve_profile(via_profile, stack)?;
             ResolvedTransport::Delegated {
                 via_profile: via_profile.clone(),
-                target: self.target.as_delegated(&format!("profile {} target", self.name))?,
+                target: self
+                    .target
+                    .as_delegated(&format!("profile {} target", self.name))?,
             }
         } else {
-            self.target
-                .validate(self.auth.as_ref(), base_dir, &format!("profile {} target", self.name))?;
+            self.target.validate(
+                self.auth.as_ref(),
+                base_dir,
+                &format!("profile {} target", self.name),
+            )?;
             for (index, bastion) in self.bastions.iter().enumerate() {
                 bastion.validate(
                     self.auth.as_ref(),
@@ -370,9 +382,11 @@ impl Profile {
                 )?;
             }
             ResolvedTransport::Direct {
-                target: self
-                    .target
-                    .resolve(self.auth.as_ref(), base_dir, &format!("profile {} target", self.name))?,
+                target: self.target.resolve(
+                    self.auth.as_ref(),
+                    base_dir,
+                    &format!("profile {} target", self.name),
+                )?,
                 bastions: self
                     .bastions
                     .iter()
@@ -570,6 +584,7 @@ impl AuthConfig {
                 }
                 Ok(ResolvedAuthConfig::Key {
                     key_path: resolve_config_path(base_dir, key_path)?,
+                    passphrase: self.passphrase.clone(),
                 })
             }
             AuthKind::Password => {
@@ -582,6 +597,11 @@ impl AuthConfig {
                         "{label} auth.type=password cannot also set key_path"
                     )));
                 }
+                if self.passphrase.is_some() {
+                    return Err(ArrtError::Config(format!(
+                        "{label} auth.type=password cannot also set passphrase"
+                    )));
+                }
                 Ok(ResolvedAuthConfig::Password { password })
             }
         }
@@ -590,14 +610,17 @@ impl AuthConfig {
     fn infer_kind(&self, label: &str) -> Result<AuthKind, ArrtError> {
         match self.kind {
             Some(kind) => Ok(kind),
-            None => match (self.key_path.is_some(), self.password.is_some()) {
+            None => match (
+                self.key_path.is_some() || self.passphrase.is_some(),
+                self.password.is_some(),
+            ) {
                 (true, false) => Ok(AuthKind::Key),
                 (false, true) => Ok(AuthKind::Password),
                 (false, false) => Err(ArrtError::Config(format!(
                     "{label} auth is missing type and credentials"
                 ))),
                 (true, true) => Err(ArrtError::Config(format!(
-                    "{label} auth must not set both key_path and password"
+                    "{label} auth must not set both key credentials and password"
                 ))),
             },
         }
@@ -605,14 +628,19 @@ impl AuthConfig {
 
     fn summary(&self, base_dir: &Path, label: &str) -> Result<Value, ArrtError> {
         Ok(match self.resolve(base_dir, label)? {
-            ResolvedAuthConfig::Key { key_path } => json!({
+            ResolvedAuthConfig::Key {
+                key_path,
+                passphrase,
+            } => json!({
                 "type": AuthKind::Key.as_str(),
                 "has_password": false,
+                "has_passphrase": passphrase.is_some(),
                 "key_path": key_path.display().to_string(),
             }),
             ResolvedAuthConfig::Password { .. } => json!({
                 "type": AuthKind::Password.as_str(),
                 "has_password": true,
+                "has_passphrase": false,
             }),
         })
     }
@@ -736,8 +764,9 @@ fn parse_config(raw: &str, path: &Path) -> Result<AppConfig, ArrtError> {
     {
         Some("yaml") | Some("yml") => serde_yaml::from_str(raw)
             .map_err(|err| ArrtError::Config(format!("invalid yaml: {err}"))),
-        Some("toml") => toml::from_str(raw)
-            .map_err(|err| ArrtError::Config(format!("invalid toml: {err}"))),
+        Some("toml") => {
+            toml::from_str(raw).map_err(|err| ArrtError::Config(format!("invalid toml: {err}")))
+        }
         _ => serde_yaml::from_str(raw)
             .or_else(|_| toml::from_str(raw))
             .map_err(|err| ArrtError::Config(format!("invalid config: {err}"))),
@@ -815,8 +844,15 @@ mod tests {
             _ => panic!("expected password auth"),
         }
         match &bastions[0].auth {
-            ResolvedAuthConfig::Key { key_path } => {
-                assert_eq!(key_path.file_name().and_then(|value| value.to_str()), Some("id_ed25519"));
+            ResolvedAuthConfig::Key {
+                key_path,
+                passphrase,
+            } => {
+                assert_eq!(
+                    key_path.file_name().and_then(|value| value.to_str()),
+                    Some("id_ed25519")
+                );
+                assert!(passphrase.is_none());
             }
             _ => panic!("expected key auth"),
         }
@@ -849,7 +885,11 @@ mod tests {
         set_base_dir(&mut config);
         config.validate().unwrap();
         let resolved = config.resolved_profile("gpu11").unwrap();
-        let ResolvedTransport::Delegated { via_profile, target } = resolved.transport else {
+        let ResolvedTransport::Delegated {
+            via_profile,
+            target,
+        } = resolved.transport
+        else {
             panic!("expected delegated transport");
         };
         assert_eq!(via_profile, "vger");
@@ -904,7 +944,138 @@ mod tests {
         let encoded = serde_json::to_string(&summary).unwrap();
         assert!(encoded.contains("\"type\":\"password\""));
         assert!(encoded.contains("\"has_password\":true"));
+        assert!(encoded.contains("\"has_passphrase\":false"));
         assert!(!encoded.contains("super-secret"));
+    }
+
+    #[test]
+    fn resolves_key_passphrase_and_redacts_it() {
+        let raw = r#"
+            [[profiles]]
+            name = "dcim"
+
+            [profiles.target]
+            host = "dcim"
+            user = "root"
+
+            [profiles.target.auth]
+            type = "key"
+            key_path = "./id_rsa_2048"
+            passphrase = "secret-passphrase"
+        "#;
+
+        let mut config: AppConfig = toml::from_str(raw).unwrap();
+        set_base_dir(&mut config);
+        config.validate().unwrap();
+
+        let resolved = config.resolved_profile("dcim").unwrap();
+        let ResolvedTransport::Direct { target, .. } = resolved.transport else {
+            panic!("expected direct transport");
+        };
+        match target.auth {
+            ResolvedAuthConfig::Key {
+                key_path,
+                passphrase,
+            } => {
+                assert_eq!(
+                    key_path.file_name().and_then(|value| value.to_str()),
+                    Some("id_rsa_2048")
+                );
+                assert_eq!(passphrase.as_deref(), Some("secret-passphrase"));
+            }
+            _ => panic!("expected key auth"),
+        }
+
+        let summary = config.profile_summary("dcim").unwrap();
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert!(encoded.contains("\"type\":\"key\""));
+        assert!(encoded.contains("\"has_passphrase\":true"));
+        assert!(!encoded.contains("secret-passphrase"));
+    }
+
+    #[test]
+    fn infers_key_auth_when_passphrase_is_present() {
+        let raw = r#"
+            [[profiles]]
+            name = "dcim"
+
+            [profiles.target]
+            host = "dcim"
+            user = "root"
+
+            [profiles.target.auth]
+            key_path = "./id_rsa_2048"
+            passphrase = "secret-passphrase"
+        "#;
+
+        let mut config: AppConfig = toml::from_str(raw).unwrap();
+        set_base_dir(&mut config);
+        config.validate().unwrap();
+
+        let resolved = config.resolved_profile("dcim").unwrap();
+        let ResolvedTransport::Direct { target, .. } = resolved.transport else {
+            panic!("expected direct transport");
+        };
+        match target.auth {
+            ResolvedAuthConfig::Key {
+                key_path,
+                passphrase,
+            } => {
+                assert_eq!(
+                    key_path.file_name().and_then(|value| value.to_str()),
+                    Some("id_rsa_2048")
+                );
+                assert_eq!(passphrase.as_deref(), Some("secret-passphrase"));
+            }
+            _ => panic!("expected key auth"),
+        }
+    }
+
+    #[test]
+    fn rejects_password_auth_with_passphrase() {
+        let raw = r#"
+            [[profiles]]
+            name = "bad"
+
+            [profiles.target]
+            host = "bad"
+            user = "root"
+
+            [profiles.target.auth]
+            type = "password"
+            password = "secret"
+            passphrase = "nope"
+        "#;
+
+        let mut config: AppConfig = toml::from_str(raw).unwrap();
+        set_base_dir(&mut config);
+        let error = config.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("target auth.type=password cannot also set passphrase"));
+    }
+
+    #[test]
+    fn rejects_mixed_password_and_key_passphrase_without_type() {
+        let raw = r#"
+            [[profiles]]
+            name = "bad"
+
+            [profiles.target]
+            host = "bad"
+            user = "root"
+
+            [profiles.target.auth]
+            password = "secret"
+            passphrase = "nope"
+        "#;
+
+        let mut config: AppConfig = toml::from_str(raw).unwrap();
+        set_base_dir(&mut config);
+        let error = config.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("target auth must not set both key credentials and password"));
     }
 
     #[test]

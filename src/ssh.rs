@@ -32,7 +32,10 @@ struct GatewayClient;
 impl client::Handler for GatewayClient {
     type Error = ArrtError;
 
-    async fn check_server_key(&mut self, _server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
@@ -44,9 +47,9 @@ impl EmbeddedSession {
             ..Default::default()
         });
 
-        let chain = profile
-            .direct_chain()
-            .ok_or_else(|| ArrtError::Ssh("embedded ssh transport requires a direct profile chain".to_string()))?;
+        let chain = profile.direct_chain().ok_or_else(|| {
+            ArrtError::Ssh("embedded ssh transport requires a direct profile chain".to_string())
+        })?;
         let mut handles: Vec<Arc<ClientHandle>> = Vec::with_capacity(chain.len());
         for endpoint in chain {
             let handle = if let Some(parent) = handles.last() {
@@ -79,12 +82,20 @@ impl EmbeddedSession {
     pub async fn disconnect(&self) {
         for handle in self.handles.iter().rev() {
             let _ = handle
-                .disconnect(Disconnect::ByApplication, "ssh-gateway session closed", "en")
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "ssh-gateway session closed",
+                    "en",
+                )
                 .await;
         }
     }
 
-    pub async fn run_command(&self, command: &str, input: Option<&[u8]>) -> Result<CommandOutput, ArrtError> {
+    pub async fn run_command(
+        &self,
+        command: &str,
+        input: Option<&[u8]>,
+    ) -> Result<CommandOutput, ArrtError> {
         let mut channel = self.target_handle()?.channel_open_session().await?;
         channel.exec(true, command.as_bytes().to_vec()).await?;
 
@@ -196,8 +207,12 @@ async fn connect_direct(
     config: Arc<client::Config>,
     endpoint: &ResolvedEndpoint,
 ) -> Result<ClientHandle, ArrtError> {
-    let mut handle =
-        client::connect(config, (endpoint.host.as_str(), endpoint.port), GatewayClient).await?;
+    let mut handle = client::connect(
+        config,
+        (endpoint.host.as_str(), endpoint.port),
+        GatewayClient,
+    )
+    .await?;
     authenticate(&mut handle, endpoint).await?;
     Ok(handle)
 }
@@ -215,14 +230,20 @@ async fn connect_via_channel(
     Ok(handle)
 }
 
-async fn authenticate(handle: &mut ClientHandle, endpoint: &ResolvedEndpoint) -> Result<(), ArrtError> {
+async fn authenticate(
+    handle: &mut ClientHandle,
+    endpoint: &ResolvedEndpoint,
+) -> Result<(), ArrtError> {
     let success = match &endpoint.auth {
         ResolvedAuthConfig::Password { password } => handle
             .authenticate_password(endpoint.user.clone(), password.clone())
             .await?
             .success(),
-        ResolvedAuthConfig::Key { key_path } => {
-            let key_pair = load_secret_key(Path::new(key_path), None)?;
+        ResolvedAuthConfig::Key {
+            key_path,
+            passphrase,
+        } => {
+            let key_pair = load_secret_key(Path::new(key_path), passphrase.as_deref())?;
             handle
                 .authenticate_publickey(
                     endpoint.user.clone(),
@@ -249,6 +270,9 @@ async fn authenticate(handle: &mut ClientHandle, endpoint: &ResolvedEndpoint) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shell_join_quotes_arguments() {
@@ -261,5 +285,51 @@ mod tests {
         assert!(command.contains("'/tmp/ssh-gatewayd'"));
         assert!(command.contains("'hello world'"));
         assert!(command.contains("'quote'\\''check'"));
+    }
+
+    #[test]
+    fn load_secret_key_supports_passphrase_protected_keys() {
+        if Command::new("ssh-keygen").arg("-V").output().is_err() {
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let key_path = std::env::temp_dir().join(format!("ssh-gateway-passphrase-test-{nonce}"));
+        let passphrase = "test-passphrase";
+
+        let status = Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                passphrase,
+                "-f",
+                key_path.to_str().expect("temp path must be utf-8"),
+                "-C",
+                "ssh-gateway-test",
+                "-q",
+            ])
+            .status()
+            .expect("failed to run ssh-keygen");
+
+        assert!(status.success(), "ssh-keygen should create a test key");
+        assert!(
+            load_secret_key(&key_path, Some(passphrase)).is_ok(),
+            "encrypted private key should load with the configured passphrase"
+        );
+        assert!(
+            load_secret_key(&key_path, Some("wrong-passphrase")).is_err(),
+            "encrypted private key should reject the wrong passphrase"
+        );
+        assert!(
+            load_secret_key(&key_path, None).is_err(),
+            "encrypted private key should reject a missing passphrase"
+        );
+
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(key_path.with_extension("pub"));
     }
 }

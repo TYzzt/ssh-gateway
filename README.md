@@ -33,8 +33,8 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 
 ## Features
 
-- **Secret isolation at the gateway API boundary**: the daemon reads passwords and key paths from config; callers send only `profile` plus operation arguments.
-- **Redacted profile and session output**: `profile show`, `session inspect`, and error payloads never echo raw passwords.
+- **Secret isolation at the gateway API boundary**: the daemon reads passwords, key paths, and optional key passphrases from config; callers send only `profile` plus operation arguments.
+- **Redacted profile and session output**: `profile show`, `session inspect`, and error payloads never echo raw passwords or passphrases.
 - **Profile-first agent workflow**: agents use named profiles instead of embedding secrets in `ssh` commands.
 - **Embedded SSH transport with session reuse**: direct and bastion profiles use in-process SSH instead of spawning local `ssh.exe` or `scp`.
 - **No local OpenSSH dependency for direct or bastion mode**: Windows and Linux direct transports run through the embedded client stack.
@@ -51,8 +51,8 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 
 ### What is isolated
 
-- Passwords and private-key paths live in `profiles.yaml`, `profiles.yml`, or legacy `profiles.toml`, and are consumed by the local gateway daemon.
-- CLI and RPC requests carry `profile` names and operation arguments, not raw password or private-key values.
+- Passwords, private-key paths, and optional key passphrases live in `profiles.yaml`, `profiles.yml`, or legacy `profiles.toml`, and are consumed by the local gateway daemon.
+- CLI and RPC requests carry `profile` names and operation arguments, not raw password, passphrase, or private-key values.
 - `profile show`, `session inspect`, and error results redact secret material before returning JSON to the caller.
 
 ### What this is not
@@ -128,6 +128,23 @@ profiles:
         auth:
           type: key
           key_path: ~/.ssh/id_ed25519
+
+### Encrypted private key with a passphrase
+
+```yaml
+profiles:
+  - name: encrypted-key-target
+    target:
+      host: secure.internal
+      user: ops
+      port: 22
+      auth:
+        type: key
+        key_path: ~/.ssh/id_rsa_2048
+        passphrase: local-key-passphrase
+```
+
+The passphrase is consumed only by the local gateway daemon. It is not returned by `profile show`, `session inspect`, or normal CLI error payloads.
 ```
 
 ### Delegated `via_profile`
@@ -172,6 +189,7 @@ user = "root"
 
 [profiles.auth]
 key_path = "~/.ssh/id_ed25519"
+passphrase = "local-key-passphrase"
 ```
 
 ## Commands
@@ -263,6 +281,7 @@ Notes:
 - The skill still expects a valid config file to already exist.
 - The skill is intentionally thin: it does not replace the CLI, it standardizes how the agent should call it.
 - `npx skills add` is the most portable option when the target agent is not Codex.
+- For passphrase-protected keys, keep the passphrase in the gateway config instead of pasting it into chat or shell flags.
 
 ## Release Workflow Overview
 
@@ -276,8 +295,8 @@ The repository ships a tag-driven GitHub Actions workflow at [.github/workflows/
 Example:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 ## License

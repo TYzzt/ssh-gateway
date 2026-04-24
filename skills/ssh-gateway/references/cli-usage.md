@@ -42,9 +42,11 @@ ssh-gateway session inspect --id <session-id>
 - `config_error`: the profile or auth configuration is invalid; fix the config instead of bypassing the gateway.
 - `ssh_error`: SSH transport or remote auth failed; inspect the target profile and bastion chain.
 - `agent_error`: the remote helper failed; review remote stderr and try again through the same profile.
+- For passphrase-protected private keys, store the `passphrase` in the profile auth block and retry through the same profile instead of switching to raw `ssh`.
 
 ## Safety reminders
 
 - Do not request raw passwords if the profile is intended to carry auth.
+- Do not request raw key passphrases if the profile is intended to carry auth.
 - Do not copy private keys into chat history.
 - Prefer named profiles and profile reuse over ad-hoc host commands.

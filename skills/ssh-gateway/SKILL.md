@@ -1,6 +1,6 @@
 ---
 name: ssh-gateway
-description: Use the local ssh-gateway CLI to run commands, read files, write files, transfer files, inspect sessions, or open tunnels on remote Linux hosts behind bastions. Trigger when the user wants agent-driven remote access through configured profiles and credentials should stay inside ssh-gateway instead of raw ssh commands, pasted passwords, or private keys.
+description: Use the local ssh-gateway CLI to run commands, read files, write files, transfer files, inspect sessions, or open tunnels on remote Linux hosts behind bastions. Trigger when the user wants agent-driven remote access through configured profiles and credentials should stay inside ssh-gateway instead of raw ssh commands, pasted passwords, private keys, or key passphrases.
 ---
 
 # ssh-gateway
@@ -14,7 +14,7 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
   - Windows PowerShell: run [scripts/install.ps1](scripts/install.ps1)
   - Linux shell: run [scripts/install.sh](scripts/install.sh)
 - Confirm a config file exists, either through `ARRT_CONFIG_PATH` or the default config locations.
-- If no config exists, stop and ask for a profile-based setup. Do not ask the user to paste a password into a shell command as a fallback.
+- If no config exists, stop and ask for a profile-based setup. Do not ask the user to paste a password or key passphrase into a shell command as a fallback.
 
 ## Workflow
 
@@ -38,6 +38,7 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
 - Only fall back to raw `ssh` if the user explicitly asks for it or if no gateway profile can serve the operation.
 - For delegated profiles, expect `tunnel open` to fail by design.
 - Do not ask the user to manually download a release asset if the bundled install scripts can do it for them.
+- For passphrase-protected keys, keep the passphrase in the gateway config and out of chat history.
 
 ## Command Patterns
 

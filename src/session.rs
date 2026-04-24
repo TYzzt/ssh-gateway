@@ -53,12 +53,11 @@ impl SessionManager {
     }
 
     pub fn sessions_json(&self) -> serde_json::Value {
-        json!(
-            self.sessions
-                .values()
-                .map(|session| self.session_summary(session))
-                .collect::<Vec<_>>()
-        )
+        json!(self
+            .sessions
+            .values()
+            .map(|session| self.session_summary(session))
+            .collect::<Vec<_>>())
     }
 
     pub fn session_json(&self, id: &str) -> Result<serde_json::Value, ArrtError> {
@@ -112,7 +111,9 @@ impl SessionManager {
         let mut expired = Vec::new();
         for (session_id, session) in &self.sessions {
             if let Ok(profile) = config.resolved_profile(&session.profile_name) {
-                if session.last_used.elapsed() > Duration::from_secs(profile.timeouts.idle_session_seconds) {
+                if session.last_used.elapsed()
+                    > Duration::from_secs(profile.timeouts.idle_session_seconds)
+                {
                     expired.push(session_id.clone());
                 }
             }
@@ -140,30 +141,34 @@ impl SessionManager {
             }
 
             let session_id = uuid::Uuid::new_v4().to_string();
-            let (transport, delegated_target, upstream_profile, owns_transport) = match &profile.transport {
-                ResolvedTransport::Direct { .. } => (
-                    Arc::new(EmbeddedSession::connect(profile).await?),
-                    None,
-                    None,
-                    true,
-                ),
-                ResolvedTransport::Delegated { via_profile, target } => {
-                    let upstream = config.resolved_profile(via_profile)?;
-                    let upstream_session_id = self.ensure_session(config, &upstream).await?;
-                    let upstream_transport = self
-                        .sessions
-                        .get(&upstream_session_id)
-                        .ok_or_else(|| ArrtError::SessionNotFound(upstream_session_id.clone()))?
-                        .transport
-                        .clone();
-                    (
-                        upstream_transport,
-                        Some(target.clone()),
-                        Some(via_profile.clone()),
-                        false,
-                    )
-                }
-            };
+            let (transport, delegated_target, upstream_profile, owns_transport) =
+                match &profile.transport {
+                    ResolvedTransport::Direct { .. } => (
+                        Arc::new(EmbeddedSession::connect(profile).await?),
+                        None,
+                        None,
+                        true,
+                    ),
+                    ResolvedTransport::Delegated {
+                        via_profile,
+                        target,
+                    } => {
+                        let upstream = config.resolved_profile(via_profile)?;
+                        let upstream_session_id = self.ensure_session(config, &upstream).await?;
+                        let upstream_transport = self
+                            .sessions
+                            .get(&upstream_session_id)
+                            .ok_or_else(|| ArrtError::SessionNotFound(upstream_session_id.clone()))?
+                            .transport
+                            .clone();
+                        (
+                            upstream_transport,
+                            Some(target.clone()),
+                            Some(via_profile.clone()),
+                            false,
+                        )
+                    }
+                };
             let session = SessionInfo {
                 session_id: session_id.clone(),
                 profile_name: profile.name.clone(),
@@ -182,7 +187,11 @@ impl SessionManager {
         })
     }
 
-    async fn ensure_agent(&mut self, profile: &ResolvedProfile, session_id: &str) -> Result<(), ArrtError> {
+    async fn ensure_agent(
+        &mut self,
+        profile: &ResolvedProfile,
+        session_id: &str,
+    ) -> Result<(), ArrtError> {
         let remote_path = profile.agent.remote_path.clone();
         let expected = expected_version(&profile.agent.version);
         let (transport, delegated_target) = {
@@ -205,9 +214,13 @@ impl SessionManager {
                     &remote_path,
                     &expected,
                 )
-                    .await?;
+                .await?;
                 let verified = self
-                    .query_agent_version(transport.as_ref(), delegated_target.as_ref(), &remote_path)
+                    .query_agent_version(
+                        transport.as_ref(),
+                        delegated_target.as_ref(),
+                        &remote_path,
+                    )
                     .await?;
                 if verified != expected {
                     return Err(ArrtError::Agent(format!(
@@ -241,7 +254,7 @@ impl SessionManager {
             &[remote_path.to_string(), "version".to_string()],
             None,
         )
-            .await?;
+        .await?;
         if output.exit_code != 0 {
             return Err(ArrtError::Agent(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -249,7 +262,9 @@ impl SessionManager {
         }
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if version.is_empty() {
-            return Err(ArrtError::Agent("remote agent returned empty version".to_string()));
+            return Err(ArrtError::Agent(
+                "remote agent returned empty version".to_string(),
+            ));
         }
         Ok(version)
     }
@@ -272,7 +287,13 @@ impl SessionManager {
             ssh::shell_quote(&target_stage),
             ssh::shell_quote(remote_path)
         );
-        let output = run_remote_command(transport, delegated_target, &command, Some(script.as_bytes())).await?;
+        let output = run_remote_command(
+            transport,
+            delegated_target,
+            &command,
+            Some(script.as_bytes()),
+        )
+        .await?;
         if output.exit_code == 0 {
             return Ok(());
         }
@@ -304,7 +325,13 @@ impl SessionManager {
         let mut remote_args = Vec::with_capacity(1 + args.len());
         remote_args.push(agent_path);
         remote_args.extend(args);
-        let output = run_remote_argv(transport.as_ref(), delegated_target.as_ref(), &remote_args, input).await?;
+        let output = run_remote_argv(
+            transport.as_ref(),
+            delegated_target.as_ref(),
+            &remote_args,
+            input,
+        )
+        .await?;
         let result = parse_agent_output(output)?;
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.last_used = Instant::now();
@@ -437,9 +464,9 @@ impl SessionManager {
             .and_then(|value| value.get("content_b64"))
             .and_then(|value| value.as_str())
             .ok_or_else(|| ArrtError::Agent("missing content_b64 in read result".to_string()))?;
-        let content = BASE64
-            .decode(content_b64.as_bytes())
-            .map_err(|err| ArrtError::Agent(format!("invalid content_b64 in read result: {err}")))?;
+        let content = BASE64.decode(content_b64.as_bytes()).map_err(|err| {
+            ArrtError::Agent(format!("invalid content_b64 in read result: {err}"))
+        })?;
         let dst = normalize_local_path(&dst)?;
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
@@ -531,10 +558,9 @@ impl SessionManager {
         _config: &AppConfig,
         tunnel_id: &str,
     ) -> Result<CommandResult, ArrtError> {
-        let mut tunnel = self
-            .tunnels
-            .remove(tunnel_id)
-            .ok_or_else(|| ArrtError::InvalidArgument(format!("unknown tunnel id: {}", tunnel_id)))?;
+        let mut tunnel = self.tunnels.remove(tunnel_id).ok_or_else(|| {
+            ArrtError::InvalidArgument(format!("unknown tunnel id: {}", tunnel_id))
+        })?;
 
         if let Some(session) = self.sessions.get_mut(&tunnel.session_id) {
             session.last_used = Instant::now();

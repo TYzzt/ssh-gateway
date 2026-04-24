@@ -142,8 +142,14 @@ pub struct SessionCommand {
 #[derive(Subcommand, Debug)]
 pub enum SessionSubcommand {
     List,
-    Inspect { #[arg(long = "id")] session_id: String },
-    Close { #[arg(long = "id")] session_id: String },
+    Inspect {
+        #[arg(long = "id")]
+        session_id: String,
+    },
+    Close {
+        #[arg(long = "id")]
+        session_id: String,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> CommandResult {
@@ -361,7 +367,10 @@ fn parse_remote_endpoint(raw: &str) -> Result<(String, u16), ArrtError> {
     Ok((host.to_string(), port))
 }
 
-async fn resolve_write_content(file: Option<String>, input: Option<String>) -> Result<Vec<u8>, ArrtError> {
+async fn resolve_write_content(
+    file: Option<String>,
+    input: Option<String>,
+) -> Result<Vec<u8>, ArrtError> {
     match (file, input) {
         (Some(path), None) => fs::read(path).await.map_err(ArrtError::from),
         (None, Some(input)) if input == "-" => {
@@ -382,7 +391,8 @@ async fn resolve_write_content(file: Option<String>, input: Option<String>) -> R
 }
 
 async fn spawn_daemon() -> Result<(), ArrtError> {
-    let exe = std::env::current_exe().map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
+    let exe =
+        std::env::current_exe().map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
     let mut command = tokio::process::Command::new(exe);
     command
         .arg("daemon")
@@ -400,7 +410,9 @@ async fn spawn_daemon() -> Result<(), ArrtError> {
             .as_std_mut()
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    command.spawn().map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
+    command
+        .spawn()
+        .map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
     Ok(())
 }
 
