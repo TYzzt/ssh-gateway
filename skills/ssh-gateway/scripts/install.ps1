@@ -1,6 +1,7 @@
 param(
     [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\ssh-gateway\bin"
+    [string]$InstallDir = "$env:LOCALAPPDATA\ssh-gateway\bin",
+    [switch]$NoPathUpdate
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +15,70 @@ $apiHeaders = @{
 
 if (-not $env:LOCALAPPDATA) {
     throw "LOCALAPPDATA is not set"
+}
+
+function Normalize-PathEntry {
+    param(
+        [string]$PathValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) {
+        return $null
+    }
+
+    $trimmed = $PathValue.Trim().Trim('"').TrimEnd('\')
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return $null
+    }
+
+    try {
+        return [System.IO.Path]::GetFullPath($trimmed).TrimEnd('\')
+    }
+    catch {
+        return $trimmed
+    }
+}
+
+function Test-PathContains {
+    param(
+        [string]$PathValue,
+        [string]$ExpectedEntry
+    )
+
+    $normalizedExpected = Normalize-PathEntry -PathValue $ExpectedEntry
+    if (-not $normalizedExpected) {
+        return $false
+    }
+
+    foreach ($entry in ($PathValue -split ';')) {
+        $normalizedEntry = Normalize-PathEntry -PathValue $entry
+        if ($normalizedEntry -and $normalizedEntry -eq $normalizedExpected) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Add-PathEntryToUserPath {
+    param(
+        [string]$PathEntry
+    )
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (Test-PathContains -PathValue $userPath -ExpectedEntry $PathEntry) {
+        return $false
+    }
+
+    $newUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) {
+        $PathEntry
+    }
+    else {
+        "$($userPath.TrimEnd(';'));$PathEntry"
+    }
+
+    [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+    return $true
 }
 
 if ($Version -eq "latest") {
@@ -53,15 +118,29 @@ try {
     $targetPath = Join-Path $InstallDir $binaryName
     Copy-Item -LiteralPath $binary.FullName -Destination $targetPath -Force
 
-    $pathEntries = ($env:PATH -split ';') | Where-Object { $_ -ne "" }
-    $onPath = $pathEntries | Where-Object { [System.IO.Path]::GetFullPath($_) -eq [System.IO.Path]::GetFullPath($InstallDir) }
+    $onPath = Test-PathContains -PathValue $env:PATH -ExpectedEntry $InstallDir
+    $userPathUpdated = $false
+
+    if (-not $onPath -and -not $NoPathUpdate) {
+        $userPathUpdated = Add-PathEntryToUserPath -PathEntry $InstallDir
+    }
+
+    $pathReadyInNewShell = $onPath -or (Test-PathContains -PathValue ([Environment]::GetEnvironmentVariable("Path", "User")) -ExpectedEntry $InstallDir)
 
     [pscustomobject]@{
         version = $versionTag
         binary_path = $targetPath
         install_dir = $InstallDir
         on_path = [bool]$onPath
-        add_to_path_hint = if ($onPath) { $null } else { "Add '$InstallDir' to PATH if you want to invoke ssh-gateway without an absolute path." }
+        user_path_updated = [bool]$userPathUpdated
+        path_ready_in_new_shell = [bool]$pathReadyInNewShell
+        add_to_path_hint = if ($pathReadyInNewShell) {
+            if ($userPathUpdated) { "Open a new shell to pick up the updated user PATH, or invoke '$targetPath' directly right now." }
+            else { $null }
+        }
+        else {
+            "Add '$InstallDir' to PATH if you want to invoke ssh-gateway without an absolute path."
+        }
     } | ConvertTo-Json -Depth 4
 }
 finally {

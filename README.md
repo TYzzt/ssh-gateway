@@ -232,11 +232,13 @@ Typical install flow:
 3. Put the binary on your `PATH`.
 4. Create a config file from [examples/profiles.yaml](examples/profiles.yaml).
 
+For the bundled Windows skill installer, the default target path is `%LOCALAPPDATA%\ssh-gateway\bin\ssh-gateway.exe`. `skills/ssh-gateway/scripts/install.ps1` also persists that directory into the user `PATH` by default, so new shells can resolve `ssh-gateway` without an absolute path.
+
 ## Install as a Skill
 
 The repository includes a portable `SKILL.md`-based skill at [skills/ssh-gateway](skills/ssh-gateway). The skill is meant for agents that support the open skills ecosystem and teaches them to prefer profile-driven `ssh-gateway` commands over raw `ssh`.
 
-The skill can also bootstrap the `ssh-gateway` binary on first use by downloading the latest GitHub Release for the current platform.
+The skill can also bootstrap the `ssh-gateway` binary on first use by downloading the latest GitHub Release for the current platform. Agents should prefer `ssh-gateway` from `PATH`, then the installer's default target path, and only then reinstall.
 
 ### Open skills ecosystem
 
@@ -317,8 +319,8 @@ The repository ships a tag-driven GitHub Actions workflow at [.github/workflows/
 Example:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 ## License

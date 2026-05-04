@@ -232,11 +232,13 @@ ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.
 3. 把二进制放进 `PATH`。
 4. 基于 [examples/profiles.yaml](examples/profiles.yaml) 准备配置文件。
 
+仓库内置的 Windows skill 安装脚本默认把二进制放到 `%LOCALAPPDATA%\ssh-gateway\bin\ssh-gateway.exe`。`skills/ssh-gateway/scripts/install.ps1` 现在还会默认把这个目录写入用户级 `PATH`，这样新开的 shell 可以直接解析 `ssh-gateway`。
+
 ## 作为 Skill 安装给智能体
 
 仓库内置了一个可移植的 `SKILL.md` 风格 skill，目录在 [skills/ssh-gateway](skills/ssh-gateway)。它面向支持开放 skills 生态的智能体，职责不是替代 CLI，而是指导 agent 优先走 profile 驱动的 `ssh-gateway` 命令，而不是回退到原始 `ssh`。
 
-这个 skill 还支持在首次使用时自动自举 `ssh-gateway` 二进制：如果本地没有 CLI，可以按当前平台从 GitHub Releases 下载最新版本。
+这个 skill 还支持在首次使用时自动自举 `ssh-gateway` 二进制：如果本地没有 CLI，可以按当前平台从 GitHub Releases 下载最新版本。agent 侧应优先尝试 `PATH` 中的 `ssh-gateway`，其次尝试安装脚本的默认落盘路径，最后才重新下载安装。
 
 ### 开放 skills 生态安装
 
@@ -317,8 +319,8 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 示例：
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 ## 许可证

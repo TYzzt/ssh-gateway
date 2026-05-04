@@ -9,7 +9,7 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
 
 ## Preconditions
 
-- Confirm a local `ssh-gateway` binary is installed and available on `PATH`, or use the user-provided binary path.
+- Confirm a local `ssh-gateway` binary is installed and available on `PATH`, in the default install location, or use the user-provided binary path.
 - If the binary is missing, install it from GitHub Releases before proceeding:
   - Windows PowerShell: run [scripts/install.ps1](scripts/install.ps1)
   - Linux shell: run [scripts/install.sh](scripts/install.sh)
@@ -20,7 +20,9 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
 
 1. Resolve the CLI path:
    - Prefer `ssh-gateway` from `PATH`
-   - Otherwise run the bundled install script for the current platform and use the installed binary path it prints
+   - Otherwise check the bundled installer's default target path first: Windows `"$env:LOCALAPPDATA\ssh-gateway\bin\ssh-gateway.exe"` or Linux `"$HOME/.local/bin/ssh-gateway"`
+   - Otherwise run the bundled install script for the current platform and use the installed `binary_path` it prints
+   - On Windows, expect the installer to persist the install directory into the user `PATH` for future shells unless explicitly disabled
 2. Validate the profile first with `ssh-gateway profile validate [name]`.
 3. Prefer profile-driven operations:
    - `exec` for commands
