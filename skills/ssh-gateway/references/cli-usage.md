@@ -41,6 +41,25 @@ ssh-gateway session list
 ssh-gateway session inspect --id <session-id>
 ```
 
+## Windows PowerShell notes
+
+When the local shell is Windows PowerShell, `ssh-gateway exec --profile ... --` does not prevent PowerShell from parsing the rest of the line first. Complex Unix command lines can fail locally before `ssh-gateway` receives them.
+
+Prefer these patterns:
+
+```text
+ssh-gateway --% exec --profile <profile> -- sudo -n find /opt /srv /home /root -maxdepth 4 -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.env' \)
+ssh-gateway exec --profile <profile> -- sudo -n bash -lc 'find /opt /srv /home /root -maxdepth 4 -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.env" \)'
+```
+
+Avoid generating Bash-style escaping directly in raw PowerShell command lines such as:
+
+```text
+ssh-gateway exec --profile <profile> -- sudo -n find /opt /srv /home /root -maxdepth 4 -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.env' \)
+```
+
+unless the command is protected by `--%` or wrapped for a remote shell like `bash -lc`.
+
 ## Failure handling
 
 - `ssh-gateway` command not found: first retry with the default install path for the platform; if it is absent, run the bundled install script for the current platform, then retry with the printed `binary_path`.

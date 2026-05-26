@@ -41,6 +41,12 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
 - For delegated profiles, expect `tunnel open` to fail by design.
 - Do not ask the user to manually download a release asset if the bundled install scripts can do it for them.
 - For passphrase-protected keys, keep the passphrase in the gateway config and out of chat history.
+- When the local shell is Windows PowerShell, do not emit complex Unix command lines directly after `ssh-gateway exec ... --` if they contain shell metacharacters such as `(`, `)`, `*`, `'`, `"`, `|`, `&`, or `;`.
+- On Windows PowerShell, prefer one of these patterns for complex remote commands:
+  - `ssh-gateway --% exec --profile <profile> -- ...`
+  - `ssh-gateway exec --profile <profile> -- bash -lc '...'`
+- Treat Bash-style escaping like `\(` and `\)` as unsafe in Windows PowerShell unless the whole tail is protected by `--%` or wrapped inside a quoted remote shell string such as `bash -lc`.
+- If a command is simple and argument-only, for example `hostname`, `env`, or `cat /etc/hostname`, direct `ssh-gateway exec --profile <profile> -- ...` is still fine.
 
 ## Command Patterns
 
