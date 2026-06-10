@@ -281,18 +281,11 @@ async fn dispatch_daemon(command: DaemonCommand) -> Result<CommandResult, ArrtEr
                 return Ok(CommandResult::success().with_data(json!({"status":"already_running"})));
             }
             spawn_daemon().await?;
-            for _ in 0..20 {
-                if ipc::send(&rpc(Request::Ping)).await.is_ok() {
-                    return Ok(CommandResult::success().with_data(json!({
-                        "status":"running",
-                        "config_path": config_path_display()?,
-                    })));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            Err(ArrtError::DaemonUnavailable(
-                "daemon did not become ready".to_string(),
-            ))
+            wait_for_daemon_ready().await?;
+            Ok(CommandResult::success().with_data(json!({
+                "status":"running",
+                "config_path": config_path_display()?,
+            })))
         }
         DaemonSubcommand::Status => {
             let response = ipc::send(&rpc(Request::Ping)).await?;
@@ -308,6 +301,7 @@ async fn send_request(request: Request, auto_start: bool) -> Result<CommandResul
         Ok(response) => Ok(response.result),
         Err(_err) if auto_start => {
             spawn_daemon().await?;
+            wait_for_daemon_ready().await?;
             let response = ipc::send(&req).await?;
             Ok(response.result)
         }
@@ -390,6 +384,18 @@ async fn resolve_write_content(
     }
 }
 
+async fn wait_for_daemon_ready() -> Result<(), ArrtError> {
+    for _ in 0..20 {
+        if ipc::send(&rpc(Request::Ping)).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(ArrtError::DaemonUnavailable(
+        "daemon did not become ready".to_string(),
+    ))
+}
+
 async fn spawn_daemon() -> Result<(), ArrtError> {
     let exe =
         std::env::current_exe().map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
@@ -409,6 +415,11 @@ async fn spawn_daemon() -> Result<(), ArrtError> {
         command
             .as_std_mut()
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
     }
     command
         .spawn()
