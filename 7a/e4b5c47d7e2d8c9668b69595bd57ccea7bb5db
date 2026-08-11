@@ -1,0 +1,59 @@
+README.zh-CN.md
+  s_695508cb4eb20e::t_7a00917321ca8c 197
+  s_695508cb4eb20e::t_bd1b20de5c6789 218-226
+  s_695508cb4eb20e::t_2b8c1fb3def351 227
+src/session.rs
+  s_695508cb4eb20e::t_bd1b20de5c6789 470,490,496,771-774
+  s_695508cb4eb20e::t_2b8c1fb3def351 2,10,441,626-627,631,732-738
+  s_695508cb4eb20e::t_bbdd5437157fca 357-358,625
+  s_695508cb4eb20e::t_82581bf9a7cd7c 14-15,370,443,447,452-456,458,469,471-476,478-480,491,493-494,628-630,632-730,739-742,759-770,775-793,795
+  s_695508cb4eb20e::t_7a00917321ca8c 743-758
+  s_695508cb4eb20e::t_5d8b54d8ced734 457
+  s_695508cb4eb20e::t_27cd8d8cb246a6 477
+  s_695508cb4eb20e::t_43e56ffab44dc0 731
+  s_695508cb4eb20e::t_df378b644c18f9 794
+  s_695508cb4eb20e::t_3d60a2caa740f0 796
+src/errors.rs
+  s_695508cb4eb20e::t_82581bf9a7cd7c 21-22,38
+Cargo.toml
+  s_695508cb4eb20e::t_82581bf9a7cd7c 22-24
+src/cli.rs
+  s_695508cb4eb20e::t_8045f550b2cf0d 559-562,568-571
+  s_695508cb4eb20e::t_bbdd5437157fca 540-552,554
+  s_695508cb4eb20e::t_82581bf9a7cd7c 9,16,29-30,107,110,113-125,346,349,351,357,359,365,379,383-397,494-504,508-536,593-597,599-600
+  s_695508cb4eb20e::t_2b8c1fb3def351 233-234,237-238,347-348,352-356,360-364,366-378,380-382,490-493,505-507,538-539,553,555-558,563-567,572-592,598
+  s_695508cb4eb20e::t_195e3d54018157 350
+  s_695508cb4eb20e::t_0fc9549135d0cb 358
+  s_695508cb4eb20e::t_0c26d4e4f58b36 398
+  s_695508cb4eb20e::t_824efb4eebaf87 489
+  s_695508cb4eb20e::t_c903ec29357166 537
+skills/ssh-gateway/references/cli-usage.md
+  s_695508cb4eb20e::t_bd1b20de5c6789 45-53
+  s_695508cb4eb20e::t_7a00917321ca8c 28
+  s_695508cb4eb20e::t_f2498499633c3d 54
+README.md
+  s_695508cb4eb20e::t_7a00917321ca8c 197
+  s_695508cb4eb20e::t_bd1b20de5c6789 218-226
+  s_695508cb4eb20e::t_2b8c1fb3def351 227
+src/daemon.rs
+  s_695508cb4eb20e::t_7a00917321ca8c 229-248
+  s_695508cb4eb20e::t_bbdd5437157fca 5,32-33,35,111,118,163-228,249
+Cargo.lock
+  s_695508cb4eb20e::t_4c066e4ea873ba 2094
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7ae4b5c47d7e2d8c9668b69595bd57ccea7bb5db",
+  "prompts": {},
+  "sessions": {
+    "s_695508cb4eb20e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019feef5-d2c6-7403-97e0-6e7389ba17c7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zhaotao1 <zhaotao1@lenovo.com>"
+    }
+  }
+}
