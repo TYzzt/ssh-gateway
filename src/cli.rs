@@ -6,12 +6,14 @@ use crate::protocol::{CommandResult, EnvVar, ErrorPayload, Request, RpcRequest, 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use tokio::fs;
 
 #[derive(Parser, Debug)]
 #[command(name = "ssh-gateway")]
 #[command(about = "Agent Remote Runtime CLI")]
+#[command(version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: TopLevelCommand,
@@ -24,8 +26,8 @@ pub enum TopLevelCommand {
     Exec(ExecCommand),
     Read(ReadCommand),
     Write(WriteCommand),
-    Upload(TransferCommand),
-    Download(TransferCommand),
+    Upload(UploadCommand),
+    Download(DownloadCommand),
     Tunnel(TunnelCommand),
     Session(SessionCommand),
 }
@@ -102,11 +104,25 @@ pub struct WriteCommand {
 }
 
 #[derive(Args, Debug)]
-pub struct TransferCommand {
+pub struct UploadCommand {
     #[arg(long)]
     pub profile: String,
+    /// Local source file. Relative paths use the CLI caller's current directory.
     #[arg(long)]
     pub src: String,
+    /// Remote destination file. Parent directories are created and existing files are overwritten.
+    #[arg(long)]
+    pub dst: String,
+}
+
+#[derive(Args, Debug)]
+pub struct DownloadCommand {
+    #[arg(long)]
+    pub profile: String,
+    /// Remote source file.
+    #[arg(long)]
+    pub src: String,
+    /// Local destination file. Relative paths use the CLI caller's current directory. Parent directories are created and existing files are atomically overwritten.
     #[arg(long)]
     pub dst: String,
 }
@@ -214,26 +230,12 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
             .await
         }
         TopLevelCommand::Upload(command) => {
-            send_request(
-                Request::Upload {
-                    profile: command.profile,
-                    src: command.src,
-                    dst: command.dst,
-                },
-                true,
-            )
-            .await
+            let request = upload_request(command)?;
+            send_request(request, true).await
         }
         TopLevelCommand::Download(command) => {
-            send_request(
-                Request::Download {
-                    profile: command.profile,
-                    src: command.src,
-                    dst: command.dst,
-                },
-                true,
-            )
-            .await
+            let request = download_request(command)?;
+            send_request(request, true).await
         }
         TopLevelCommand::Tunnel(command) => match command.command {
             TunnelSubcommand::Open {
@@ -333,6 +335,59 @@ fn rpc(request: Request) -> RpcRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         request,
     }
+}
+
+fn upload_request(command: UploadCommand) -> Result<Request, ArrtError> {
+    let client_cwd = std::env::current_dir()?;
+    upload_request_from(command, &client_cwd)
+}
+
+fn upload_request_from(command: UploadCommand, client_cwd: &Path) -> Result<Request, ArrtError> {
+    Ok(Request::Upload {
+        profile: command.profile,
+        src: resolve_client_local_path(command.src, client_cwd)?,
+        dst: command.dst,
+    })
+}
+
+fn download_request(command: DownloadCommand) -> Result<Request, ArrtError> {
+    let client_cwd = std::env::current_dir()?;
+    download_request_from(command, &client_cwd)
+}
+
+fn download_request_from(
+    command: DownloadCommand,
+    client_cwd: &Path,
+) -> Result<Request, ArrtError> {
+    Ok(Request::Download {
+        profile: command.profile,
+        src: command.src,
+        dst: resolve_client_local_path(command.dst, client_cwd)?,
+    })
+}
+
+fn resolve_client_local_path(path: String, client_cwd: &Path) -> Result<String, ArrtError> {
+    if Path::new(&path).is_absolute() {
+        return Ok(path);
+    }
+    normalize_absolute_path(&client_cwd.join(path))
+        .into_os_string()
+        .into_string()
+        .map_err(|_| ArrtError::InvalidArgument("local path is not valid UTF-8".to_string()))
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn parse_env(raw: String) -> Result<EnvVar, ArrtError> {
@@ -440,5 +495,117 @@ fn error_result(err: ArrtError) -> CommandResult {
             message: err.to_string(),
         }),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn upload(src: &str, dst: &str) -> UploadCommand {
+        UploadCommand {
+            profile: "test".to_string(),
+            src: src.to_string(),
+            dst: dst.to_string(),
+        }
+    }
+
+    fn download(src: &str, dst: &str) -> DownloadCommand {
+        DownloadCommand {
+            profile: "test".to_string(),
+            src: src.to_string(),
+            dst: dst.to_string(),
+        }
+    }
+
+    #[test]
+    fn version_flag_is_available() {
+        let error = Cli::try_parse_from(["ssh-gateway", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+
+        let short = Cli::try_parse_from(["ssh-gateway", "-V"]).unwrap_err();
+        assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn transfer_help_explains_local_and_remote_paths() {
+        let upload = Cli::try_parse_from(["ssh-gateway", "upload", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(upload.contains("Local source file"));
+        assert!(upload.contains("Remote destination file"));
+        assert!(upload.contains("overwritten"));
+
+        let download = Cli::try_parse_from(["ssh-gateway", "download", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(download.contains("Remote source file"));
+        assert!(download.contains("Local destination file"));
+        assert!(download.contains("atomically overwritten"));
+    }
+
+    #[test]
+    fn transfer_requests_resolve_local_paths_against_client_cwd() {
+        #[cfg(windows)]
+        let (client_cwd, daemon_cwd) = (
+            PathBuf::from(r"C:\Users\caller\work"),
+            PathBuf::from(r"D:\daemon\work"),
+        );
+        #[cfg(not(windows))]
+        let (client_cwd, daemon_cwd) = (
+            PathBuf::from("/home/caller/work"),
+            PathBuf::from("/srv/daemon/work"),
+        );
+
+        let upload =
+            upload_request_from(upload("input/local.txt", "/tmp/local.txt"), &client_cwd).unwrap();
+        let download =
+            download_request_from(download("/tmp/remote.txt", "output/local.txt"), &client_cwd)
+                .unwrap();
+
+        match upload {
+            Request::Upload { src, .. } => {
+                let src = PathBuf::from(src);
+                assert_eq!(src, client_cwd.join("input/local.txt"));
+                assert!(src.is_absolute());
+                assert!(!src.starts_with(&daemon_cwd));
+            }
+            _ => panic!("expected upload request"),
+        }
+        match download {
+            Request::Download { dst, .. } => {
+                let dst = PathBuf::from(dst);
+                assert_eq!(dst, client_cwd.join("output/local.txt"));
+                assert!(dst.is_absolute());
+                assert!(!dst.starts_with(&daemon_cwd));
+            }
+            _ => panic!("expected download request"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_path_resolution_preserves_windows_absolute_paths() {
+        let client_cwd = Path::new(r"C:\Users\caller\work");
+
+        assert_eq!(
+            resolve_client_local_path(r"D:\archive\file.txt".to_string(), client_cwd).unwrap(),
+            r"D:\archive\file.txt"
+        );
+        assert_eq!(
+            resolve_client_local_path(r"\\server\share\file.txt".to_string(), client_cwd).unwrap(),
+            r"\\server\share\file.txt"
+        );
+        assert_eq!(
+            resolve_client_local_path(r"paper\file.txt".to_string(), client_cwd).unwrap(),
+            r"C:\Users\caller\work\paper\file.txt"
+        );
+        assert_eq!(
+            resolve_client_local_path(r".\paper drafts\old\..\file.txt".to_string(), client_cwd,)
+                .unwrap(),
+            r"C:\Users\caller\work\paper drafts\file.txt"
+        );
     }
 }

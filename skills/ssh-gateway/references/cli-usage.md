@@ -25,6 +25,7 @@ Use these checks before any remote action:
 ssh-gateway profile validate
 ssh-gateway profile validate <profile>
 ssh-gateway daemon status
+ssh-gateway --version
 ```
 
 ## Common operations
@@ -39,6 +40,16 @@ ssh-gateway download --profile <profile> --src /tmp/local.txt --dst ./local-copy
 ssh-gateway tunnel open --profile <profile> --local 8080 --remote 127.0.0.1:11434
 ssh-gateway session list
 ssh-gateway session inspect --id <session-id>
+```
+
+Relative local paths for `upload --src` and `download --dst` are resolved from the CLI caller's current working directory, not the daemon's working directory. Relative `.` and `..` components are normalized. The daemon rejects relative local paths received directly over RPC with `relative_local_path`.
+
+Uploads create remote parent directories and overwrite existing remote files. Downloads create local parent directories and atomically overwrite existing local files after receiving and syncing the complete content. Transfer JSON reports `local_src`/`remote_dst` or `remote_src`/`local_dst`; downloads also report whether an existing file was `overwritten`.
+
+Under MSYS2, set `MSYS2_ARG_CONV_EXCL="*"` on transfer commands. Otherwise MSYS2 may rewrite remote POSIX paths before the CLI can distinguish them from local paths:
+
+```text
+MSYS2_ARG_CONV_EXCL="*" ssh-gateway upload --profile <profile> --src ./local.txt --dst /tmp/local.txt
 ```
 
 ## Windows PowerShell notes

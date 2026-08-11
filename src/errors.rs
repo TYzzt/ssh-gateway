@@ -18,6 +18,8 @@ pub enum ArrtError {
     SessionNotFound(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("relative local path: {0}")]
+    RelativeLocalPath(String),
     #[error("io error: {0}")]
     Io(String),
 }
@@ -33,6 +35,7 @@ impl ArrtError {
             Self::Agent(_) => "agent_error",
             Self::SessionNotFound(_) => "session_not_found",
             Self::InvalidArgument(_) => "invalid_argument",
+            Self::RelativeLocalPath(_) => "relative_local_path",
             Self::Io(_) => "io_error",
         }
     }

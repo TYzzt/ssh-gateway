@@ -194,7 +194,7 @@ passphrase = "local-key-passphrase"
 
 ## Commands
 
-All commands print JSON.
+Operational commands print JSON. Standard `--help` and `--version` output plain text.
 
 | Area | Commands |
 | --- | --- |
@@ -213,6 +213,16 @@ ssh-gateway write --profile delegated-target --path /tmp/demo.txt --input hello
 ssh-gateway upload --profile delegated-target --src ./local.txt --dst /tmp/local.txt
 ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
+```
+
+Relative local paths are resolved from the CLI caller's current working directory. This applies to `upload --src` and `download --dst`; the daemon rejects relative local paths at the RPC boundary and never resolves them from its own working directory. `.` and `..` in relative local paths are normalized before the request is sent. Windows drive-letter and UNC absolute paths are preserved.
+
+Uploads create remote parent directories and overwrite an existing remote destination. Downloads create local parent directories and atomically replace an existing local destination only after the complete content has been received and synced. Transfer JSON includes the resolved path pair: `local_src`/`remote_dst` for uploads and `remote_src`/`local_dst` for downloads. Download results also include `overwritten`.
+
+Under MSYS2, set `MSYS2_ARG_CONV_EXCL="*"` for transfer commands so MSYS2 does not rewrite remote POSIX paths before `ssh-gateway` receives them:
+
+```bash
+MSYS2_ARG_CONV_EXCL="*" ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ```
 
 `daemon stop` returns `{"status":"stopping"}` when it successfully signals a running daemon and `{"status":"not_running"}` when nothing is listening.

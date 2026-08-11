@@ -723,14 +723,6 @@ pub fn config_path_display() -> Result<String, ArrtError> {
     Ok(config_path()?.display().to_string())
 }
 
-pub fn normalize_local_path(path: &str) -> Result<PathBuf, ArrtError> {
-    let input = Path::new(path);
-    if input.is_absolute() {
-        return Ok(input.to_path_buf());
-    }
-    Ok(std::env::current_dir()?.join(input))
-}
-
 fn resolve_config_path(base_dir: &Path, raw: &str) -> Result<PathBuf, ArrtError> {
     let expanded = expand_home(raw)?;
     if expanded.is_absolute() {

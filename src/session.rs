@@ -1,7 +1,5 @@
 use crate::agent::{expected_version, render_agent_script};
-use crate::config::{
-    normalize_local_path, AppConfig, DelegatedEndpoint, ResolvedProfile, ResolvedTransport,
-};
+use crate::config::{AppConfig, DelegatedEndpoint, ResolvedProfile, ResolvedTransport};
 use crate::errors::ArrtError;
 use crate::protocol::{CommandResult, EnvVar, ErrorPayload, WriteMode};
 use crate::ssh::{self, CommandOutput, EmbeddedSession};
@@ -9,10 +7,12 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::fs;
+use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -354,7 +354,8 @@ impl SessionManager {
         let started = Instant::now();
         let mut args = vec![
             "exec".to_string(),
-            cwd.map(|value| BASE64.encode(value))
+            cwd.as_ref()
+                .map(|value| BASE64.encode(value))
                 .unwrap_or_else(|| "-".to_string()),
             timeout_seconds
                 .unwrap_or(profile.timeouts.exec_seconds)
@@ -366,6 +367,7 @@ impl SessionManager {
                 .map(|item| BASE64.encode(format!("{}={}", item.key, item.value))),
         );
         let mut result = self.invoke_agent(&session_id, args, None).await?;
+        classify_remote_cwd_error(&mut result, cwd.as_deref());
         result.duration_ms = Some(started.elapsed().as_millis());
         result.session_id = Some(session_id);
         Ok(result)
@@ -436,17 +438,24 @@ impl SessionManager {
         src: String,
         dst: String,
     ) -> Result<CommandResult, ArrtError> {
-        let src = normalize_local_path(&src)?;
+        let src = absolute_local_path(src, "upload src")?;
         let content = fs::read(&src).await?;
-        let result = self
+        let mut result = self
             .write(
                 config,
                 profile_name,
-                dst,
+                dst.clone(),
                 WriteMode::Truncate,
                 BASE64.encode(content),
             )
             .await?;
+        add_transfer_paths(
+            &mut result,
+            "local_src",
+            &src.display().to_string(),
+            "remote_dst",
+            &dst,
+        );
         Ok(result)
     }
 
@@ -457,7 +466,18 @@ impl SessionManager {
         src: String,
         dst: String,
     ) -> Result<CommandResult, ArrtError> {
-        let mut result = self.read(config, profile_name, src).await?;
+        let dst = absolute_local_path(dst, "download dst")?;
+        let mut result = self.read(config, profile_name, src.clone()).await?;
+        if !result.ok {
+            add_transfer_paths(
+                &mut result,
+                "remote_src",
+                &src,
+                "local_dst",
+                &dst.display().to_string(),
+            );
+            return Ok(result);
+        }
         let content_b64 = result
             .data
             .as_ref()
@@ -467,13 +487,13 @@ impl SessionManager {
         let content = BASE64.decode(content_b64.as_bytes()).map_err(|err| {
             ArrtError::Agent(format!("invalid content_b64 in read result: {err}"))
         })?;
-        let dst = normalize_local_path(&dst)?;
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        fs::write(&dst, content).await?;
+        let overwritten = dst.exists();
+        atomic_write(&dst, &content).await?;
         result.data = Some(json!({
+            "remote_src": src,
+            "local_dst": dst.display().to_string(),
             "saved_to": dst.display().to_string(),
+            "overwritten": overwritten,
         }));
         Ok(result)
     }
@@ -599,6 +619,178 @@ impl SessionManager {
             "agent_version": session.agent_version,
             "agent_ready": session.agent_path.is_some() && session.agent_version.is_some(),
         })
+    }
+}
+
+pub(crate) fn absolute_local_path(path: String, argument: &str) -> Result<PathBuf, ArrtError> {
+    if Path::new(&path).is_absolute() {
+        return Ok(PathBuf::from(path));
+    }
+    Err(ArrtError::RelativeLocalPath(format!(
+        "{argument} must be absolute; resolve it against the CLI caller's current directory before sending the RPC request"
+    )))
+}
+
+fn add_transfer_paths(
+    result: &mut CommandResult,
+    local_key: &str,
+    local_path: &str,
+    remote_key: &str,
+    remote_path: &str,
+) {
+    let data = result.data.get_or_insert_with(|| json!({}));
+    if let Some(object) = data.as_object_mut() {
+        object.insert(local_key.to_string(), json!(local_path));
+        object.insert(remote_key.to_string(), json!(remote_path));
+    }
+}
+
+async fn atomic_write(dst: &Path, content: &[u8]) -> Result<(), ArrtError> {
+    let parent = dst.parent().ok_or_else(|| {
+        ArrtError::InvalidArgument(format!(
+            "download destination has no parent: {}",
+            dst.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).await?;
+    let file_name = dst.file_name().ok_or_else(|| {
+        ArrtError::InvalidArgument(format!(
+            "download destination is not a file: {}",
+            dst.display()
+        ))
+    })?;
+    let temp = parent.join(format!(
+        ".{}.ssh-gateway-{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = async {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await?;
+        file.write_all(content).await?;
+        file.sync_all().await?;
+        drop(file);
+        atomic_replace(&temp, dst).await
+    }
+    .await;
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp).await;
+    }
+    write_result
+}
+
+#[cfg(not(windows))]
+async fn atomic_replace(src: &Path, dst: &Path) -> Result<(), ArrtError> {
+    fs::rename(src, dst).await.map_err(ArrtError::from)
+}
+
+#[cfg(windows)]
+async fn atomic_replace(src: &Path, dst: &Path) -> Result<(), ArrtError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src_wide: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        return Err(ArrtError::Io(std::io::Error::last_os_error().to_string()));
+    }
+    Ok(())
+}
+
+fn classify_remote_cwd_error(result: &mut CommandResult, cwd: Option<&str>) {
+    let Some(cwd) = cwd else { return };
+    if result.ok {
+        return;
+    }
+    let stderr = result.stderr.to_ascii_lowercase();
+    let cwd_missing = stderr.contains("no such file or directory")
+        && (stderr.contains("cd:") || stderr.contains("can't cd"));
+    if cwd_missing {
+        result.error = Some(ErrorPayload {
+            code: "remote_cwd_not_found".to_string(),
+            message: format!("remote cwd not found: {cwd}"),
+        });
+        let data = result.data.get_or_insert_with(|| json!({}));
+        if let Some(object) = data.as_object_mut() {
+            object.insert("remote_cwd".to_string(), json!(cwd));
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_path_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_rejects_relative_local_paths() {
+        let error = absolute_local_path("relative/file.txt".to_string(), "upload src").unwrap_err();
+        assert!(error.to_string().contains("upload src must be absolute"));
+        assert_eq!(error.code(), "relative_local_path");
+    }
+
+    #[test]
+    fn transfer_results_include_local_and_remote_paths() {
+        let mut result = CommandResult::success();
+        add_transfer_paths(
+            &mut result,
+            "local_src",
+            r"C:\work\input.txt",
+            "remote_dst",
+            "/tmp/input.txt",
+        );
+
+        let data = result.data.unwrap();
+        assert_eq!(data["local_src"], r"C:\work\input.txt");
+        assert_eq!(data["remote_dst"], "/tmp/input.txt");
+    }
+
+    #[tokio::test]
+    async fn atomic_write_overwrites_complete_file_and_creates_parents() {
+        let root = std::env::temp_dir().join(format!("ssh-gateway-test-{}", uuid::Uuid::new_v4()));
+        let dst = root.join("nested").join("download.txt");
+        fs::create_dir_all(dst.parent().unwrap()).await.unwrap();
+        fs::write(&dst, b"old content").await.unwrap();
+
+        atomic_write(&dst, b"complete replacement").await.unwrap();
+
+        assert_eq!(fs::read(&dst).await.unwrap(), b"complete replacement");
+        let entries = std::fs::read_dir(dst.parent().unwrap()).unwrap().count();
+        assert_eq!(entries, 1, "temporary file should be removed after rename");
+
+        let new_dst = root.join("created").join("parents").join("download.txt");
+        atomic_write(&new_dst, b"new file").await.unwrap();
+        assert_eq!(fs::read(&new_dst).await.unwrap(), b"new file");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn classifies_missing_remote_cwd() {
+        let mut result = CommandResult::success();
+        result.ok = false;
+        result.exit_code = Some(2);
+        result.stderr =
+            "sh: 1: cd: can't cd to /missing/path: No such file or directory".to_string();
+        result.error = Some(ErrorPayload {
+            code: "remote_command_failed".to_string(),
+            message: result.stderr.clone(),
+        });
+
+        classify_remote_cwd_error(&mut result, Some("/missing/path"));
+
+        assert_eq!(result.error.unwrap().code, "remote_cwd_not_found");
+        assert_eq!(result.data.unwrap()["remote_cwd"], "/missing/path");
     }
 }
 

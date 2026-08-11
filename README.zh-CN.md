@@ -194,7 +194,7 @@ passphrase = "local-key-passphrase"
 
 ## 命令
 
-所有命令都输出 JSON。
+业务命令输出 JSON；标准 `--help` 和 `--version` 输出纯文本。
 
 | 范围 | 命令 |
 | --- | --- |
@@ -213,6 +213,16 @@ ssh-gateway write --profile delegated-target --path /tmp/demo.txt --input hello
 ssh-gateway upload --profile delegated-target --src ./local.txt --dst /tmp/local.txt
 ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
+```
+
+本地相对路径以调用 CLI 时的当前工作目录为基准。该规则适用于 `upload --src` 和 `download --dst`；daemon 会在 RPC 边界拒绝相对本地路径，不会按自身工作目录解析。相对本地路径中的 `.` 和 `..` 会在发送请求前规范化；Windows 盘符绝对路径和 UNC 路径保持不变。
+
+上传会创建远端父目录并覆盖已有远端目标；下载会创建本地父目录，完整接收并同步内容后再原子替换已有本地目标。传输 JSON 会返回实际路径对：上传为 `local_src`/`remote_dst`，下载为 `remote_src`/`local_dst`；下载还会返回 `overwritten`。
+
+在 MSYS2 下执行传输命令时应设置 `MSYS2_ARG_CONV_EXCL="*"`，避免 MSYS2 在 `ssh-gateway` 接收参数前错误转换远端 POSIX 路径：
+
+```bash
+MSYS2_ARG_CONV_EXCL="*" ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ```
 
 `daemon stop` 在成功通知一个正在运行的 daemon 时返回 `{"status":"stopping"}`；如果当前没有 daemon 在监听，则返回 `{"status":"not_running"}`。
