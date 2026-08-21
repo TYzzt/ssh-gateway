@@ -1,0 +1,47 @@
+Cargo.toml
+  s_4d4059d4f0fd31::t_7f6da1ec5c7850 3
+src/ipc.rs
+  s_4d4059d4f0fd31::t_74cb3047d4f5a9 168-198
+  s_4d4059d4f0fd31::t_83693b83a45b8f 7,18-19,56-90,98,107
+src/daemon.rs
+  s_4d4059d4f0fd31::t_56c761bbcdca3e 85-95
+src/ssh.rs
+  s_4d4059d4f0fd31::t_7f6da1ec5c7850 303,315,321
+  s_4d4059d4f0fd31::t_74cb3047d4f5a9 319-320
+  s_4d4059d4f0fd31::t_aa9b9005b7ed98 318
+  s_4d4059d4f0fd31::t_7cf33b9a630050 322
+src/session.rs
+  s_4d4059d4f0fd31::t_7f6da1ec5c7850 395
+  s_4d4059d4f0fd31::t_fd61ad439a391f 31-47,130-132,202,363,371,375,381,388-393,396-435,439-445
+  s_695508cb4eb20e::t_f0a9b72f4e1317 394
+src/cli.rs
+  s_4d4059d4f0fd31::t_364345e0b0119a 1,195-205,207,210
+src/errors.rs
+  s_4d4059d4f0fd31::t_59c1c8b2d23c89 13-14,36
+Cargo.lock
+  s_695508cb4eb20e::t_e05194dff6ce15 2081
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a629765107d14f56f49267da722cf35b07136207",
+  "prompts": {},
+  "sessions": {
+    "s_4d4059d4f0fd31": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a022d6-3997-7272-8ca5-09999efeba4b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zhaotao1 <zhaotao1@lenovo.com>"
+    },
+    "s_695508cb4eb20e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019feef5-d2c6-7403-97e0-6e7389ba17c7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zhaotao1 <zhaotao1@lenovo.com>"
+    }
+  }
+}
