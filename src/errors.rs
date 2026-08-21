@@ -10,6 +10,8 @@ pub enum ArrtError {
     DaemonUnavailable(String),
     #[error("ipc error: {0}")]
     Ipc(String),
+    #[error("request timeout: {0}")]
+    RequestTimeout(String),
     #[error("ssh error: {0}")]
     Ssh(String),
     #[error("agent error: {0}")]
@@ -31,6 +33,7 @@ impl ArrtError {
             Self::ProfileNotFound(_) => "profile_not_found",
             Self::DaemonUnavailable(_) => "daemon_unavailable",
             Self::Ipc(_) => "ipc_error",
+            Self::RequestTimeout(_) => "request_timeout",
             Self::Ssh(_) => "ssh_error",
             Self::Agent(_) => "agent_error",
             Self::SessionNotFound(_) => "session_not_found",

@@ -4,6 +4,7 @@ use crate::protocol::{Request, RpcRequest, RpcResponse};
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::{TcpListener, TcpStream};
@@ -14,6 +15,8 @@ use crate::config::ensure_runtime_dirs;
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 const WINDOWS_DAEMON_ADDR: &str = "127.0.0.1:46173";
+const IPC_GRACE: Duration = Duration::from_secs(15);
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[cfg(unix)]
 pub fn endpoint_path() -> Result<PathBuf, ArrtError> {
@@ -50,6 +53,41 @@ async fn read_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
     serde_json::from_slice(&payload).map_err(|err| ArrtError::Ipc(format!("decode frame: {err}")))
 }
 
+fn response_timeout(request: &RpcRequest) -> Option<Duration> {
+    match &request.request {
+        Request::Exec {
+            timeout_seconds: Some(0),
+            ..
+        } => None,
+        Request::Exec {
+            timeout_seconds: Some(seconds),
+            ..
+        } => Some(Duration::from_secs(seconds.saturating_add(25))),
+        Request::Ping
+        | Request::ProfileList
+        | Request::ProfileShow { .. }
+        | Request::ProfileValidate { .. } => Some(IPC_GRACE),
+        _ => Some(DEFAULT_RPC_TIMEOUT),
+    }
+}
+
+async fn read_response<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    request: &RpcRequest,
+) -> Result<RpcResponse, ArrtError> {
+    match response_timeout(request) {
+        Some(deadline) => tokio::time::timeout(deadline, read_frame(reader))
+            .await
+            .map_err(|_| {
+                ArrtError::RequestTimeout(format!(
+                    "daemon response exceeded {} seconds",
+                    deadline.as_secs()
+                ))
+            })?,
+        None => read_frame(reader).await,
+    }
+}
+
 #[cfg(unix)]
 pub async fn send(request: &RpcRequest) -> Result<RpcResponse, ArrtError> {
     let path = endpoint_path()?;
@@ -57,7 +95,7 @@ pub async fn send(request: &RpcRequest) -> Result<RpcResponse, ArrtError> {
         .await
         .map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
     write_frame(&mut stream, request).await?;
-    read_frame(&mut stream).await
+    read_response(&mut stream, request).await
 }
 
 #[cfg(windows)]
@@ -66,7 +104,7 @@ pub async fn send(request: &RpcRequest) -> Result<RpcResponse, ArrtError> {
         .await
         .map_err(|err| ArrtError::DaemonUnavailable(err.to_string()))?;
     write_frame(&mut stream, request).await?;
-    read_frame(&mut stream).await
+    read_response(&mut stream, request).await
 }
 
 #[cfg(unix)]
@@ -126,4 +164,35 @@ pub async fn serve(state: Arc<DaemonState>) -> Result<(), ArrtError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exec_request(timeout_seconds: u64) -> RpcRequest {
+        RpcRequest {
+            request_id: "test".to_string(),
+            request: Request::Exec {
+                profile: "test".to_string(),
+                command: "true".to_string(),
+                cwd: None,
+                timeout_seconds: Some(timeout_seconds),
+                env: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn exec_response_timeout_includes_transport_grace() {
+        assert_eq!(
+            response_timeout(&exec_request(20)),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn explicitly_unbounded_exec_has_no_ipc_deadline() {
+        assert_eq!(response_timeout(&exec_request(0)), None);
+    }
 }

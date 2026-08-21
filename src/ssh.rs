@@ -300,7 +300,7 @@ mod tests {
         let key_path = std::env::temp_dir().join(format!("ssh-gateway-passphrase-test-{nonce}"));
         let passphrase = "test-passphrase";
 
-        let status = Command::new("ssh-keygen")
+        let output = Command::new("ssh-keygen")
             .args([
                 "-t",
                 "ed25519",
@@ -312,10 +312,14 @@ mod tests {
                 "ssh-gateway-test",
                 "-q",
             ])
-            .status()
+            .output()
             .expect("failed to run ssh-keygen");
 
-        assert!(status.success(), "ssh-keygen should create a test key");
+        assert!(
+            key_path.is_file(),
+            "ssh-keygen should create a private key: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             load_secret_key(&key_path, Some(passphrase)).is_ok(),
             "encrypted private key should load with the configured passphrase"

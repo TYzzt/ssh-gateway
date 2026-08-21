@@ -82,11 +82,17 @@ impl DaemonState {
                 env,
             } => {
                 let config = AppConfig::load().await?;
-                let mut sessions = self.sessions.lock().await;
-                sessions.reap_idle_sessions(&config).await;
-                sessions
-                    .exec(&config, &profile, command, cwd, timeout_seconds, env)
-                    .await
+                let prepared = {
+                    let mut sessions = self.sessions.lock().await;
+                    sessions.reap_idle_sessions(&config).await;
+                    sessions
+                        .prepare_exec(&config, &profile, command, cwd, timeout_seconds, env)
+                        .await?
+                };
+                let session_id = prepared.session_id().to_string();
+                let result = SessionManager::execute_prepared_exec(&prepared).await;
+                self.sessions.lock().await.finish_exec(&session_id);
+                result
             }
             Request::Read { profile, path } => {
                 let config = AppConfig::load().await?;

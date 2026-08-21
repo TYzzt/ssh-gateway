@@ -28,6 +28,23 @@ pub struct SessionInfo {
     pub agent_path: Option<String>,
     pub agent_version: Option<String>,
     pub last_used: Instant,
+    pub active_operations: usize,
+}
+
+pub struct PreparedExec {
+    session_id: String,
+    transport: Arc<EmbeddedSession>,
+    delegated_target: Option<DelegatedEndpoint>,
+    remote_args: Vec<String>,
+    cwd: Option<String>,
+    timeout_seconds: u64,
+    started: Instant,
+}
+
+impl PreparedExec {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 #[derive(Debug)]
@@ -110,6 +127,9 @@ impl SessionManager {
     pub async fn reap_idle_sessions(&mut self, config: &AppConfig) {
         let mut expired = Vec::new();
         for (session_id, session) in &self.sessions {
+            if session.active_operations > 0 {
+                continue;
+            }
             if let Ok(profile) = config.resolved_profile(&session.profile_name) {
                 if session.last_used.elapsed()
                     > Duration::from_secs(profile.timeouts.idle_session_seconds)
@@ -179,6 +199,7 @@ impl SessionManager {
                 agent_path: None,
                 agent_version: None,
                 last_used: Instant::now(),
+                active_operations: 0,
             };
             self.profile_index
                 .insert(profile.name.clone(), session_id.clone());
@@ -339,7 +360,7 @@ impl SessionManager {
         Ok(result)
     }
 
-    pub async fn exec(
+    pub async fn prepare_exec(
         &mut self,
         config: &AppConfig,
         profile_name: &str,
@@ -347,30 +368,79 @@ impl SessionManager {
         cwd: Option<String>,
         timeout_seconds: Option<u64>,
         env: Vec<EnvVar>,
-    ) -> Result<CommandResult, ArrtError> {
+    ) -> Result<PreparedExec, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
         let session_id = self.ensure_session(config, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
-        let started = Instant::now();
+        let timeout_seconds = timeout_seconds.unwrap_or(profile.timeouts.exec_seconds);
         let mut args = vec![
             "exec".to_string(),
             cwd.as_ref()
                 .map(|value| BASE64.encode(value))
                 .unwrap_or_else(|| "-".to_string()),
-            timeout_seconds
-                .unwrap_or(profile.timeouts.exec_seconds)
-                .to_string(),
+            timeout_seconds.to_string(),
             BASE64.encode(command),
         ];
         args.extend(
             env.into_iter()
                 .map(|item| BASE64.encode(format!("{}={}", item.key, item.value))),
         );
-        let mut result = self.invoke_agent(&session_id, args, None).await?;
-        classify_remote_cwd_error(&mut result, cwd.as_deref());
-        result.duration_ms = Some(started.elapsed().as_millis());
-        result.session_id = Some(session_id);
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| ArrtError::SessionNotFound(session_id.clone()))?;
+        let agent_path = session.agent_path.clone().ok_or_else(|| {
+            ArrtError::Agent(format!("agent is not ready for session {session_id}"))
+        })?;
+        session.active_operations += 1;
+        let mut remote_args = Vec::with_capacity(1 + args.len());
+        remote_args.push(agent_path);
+        remote_args.extend(args);
+        Ok(PreparedExec {
+            session_id,
+            transport: session.transport.clone(),
+            delegated_target: session.delegated_target.clone(),
+            remote_args,
+            cwd,
+            timeout_seconds,
+            started: Instant::now(),
+        })
+    }
+
+    pub async fn execute_prepared_exec(
+        prepared: &PreparedExec,
+    ) -> Result<CommandResult, ArrtError> {
+        let operation = run_remote_argv(
+            prepared.transport.as_ref(),
+            prepared.delegated_target.as_ref(),
+            &prepared.remote_args,
+            None,
+        );
+        let output = if prepared.timeout_seconds == 0 {
+            operation.await?
+        } else {
+            let deadline = Duration::from_secs(prepared.timeout_seconds.saturating_add(10));
+            tokio::time::timeout(deadline, operation)
+                .await
+                .map_err(|_| {
+                    ArrtError::RequestTimeout(format!(
+                        "remote exec exceeded {} seconds including transport grace",
+                        deadline.as_secs()
+                    ))
+                })??
+        };
+        let mut result = parse_agent_output(output)?;
+        classify_remote_cwd_error(&mut result, prepared.cwd.as_deref());
+        result.duration_ms = Some(prepared.started.elapsed().as_millis());
+        result.session_id = Some(prepared.session_id.clone());
         Ok(result)
+    }
+
+    pub fn finish_exec(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.active_operations = session.active_operations.saturating_sub(1);
+            session.last_used = Instant::now();
+        }
     }
 
     pub async fn read(

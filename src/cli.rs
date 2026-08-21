@@ -1,4 +1,4 @@
-use crate::config::config_path_display;
+use crate::config::{config_path_display, AppConfig};
 use crate::daemon::DaemonState;
 use crate::errors::ArrtError;
 use crate::ipc;
@@ -192,11 +192,22 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 .into_iter()
                 .map(parse_env)
                 .collect::<Result<Vec<_>, _>>()?;
+            let profile = command.profile;
+            let timeout_seconds = match command.timeout {
+                Some(seconds) => Some(seconds),
+                None => Some(
+                    AppConfig::load()
+                        .await?
+                        .resolved_profile(&profile)?
+                        .timeouts
+                        .exec_seconds,
+                ),
+            };
             let request = Request::Exec {
-                profile: command.profile,
+                profile,
                 command: command.command.join(" "),
                 cwd: command.cwd,
-                timeout_seconds: command.timeout,
+                timeout_seconds,
                 env,
             };
             send_request(request, true).await
