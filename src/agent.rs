@@ -1,9 +1,10 @@
 pub fn expected_version(version: &str) -> String {
-    if version.trim().is_empty() {
+    let base = if version.trim().is_empty() {
         env!("CARGO_PKG_VERSION").to_string()
     } else {
         version.to_string()
-    }
+    };
+    format!("{base}+policy-fd-v1")
 }
 
 pub fn render_agent_script(version: &str) -> String {
@@ -95,6 +96,48 @@ run_read() {{
   rm -f "$out_file" "$err_file"
 }}
 
+path_allowed_fd() {{
+  fd="$1"
+  shift
+  actual="$(readlink -f "/proc/$$/fd/$fd" 2>/dev/null || true)"
+  [ -n "$actual" ] || return 1
+  while [ "$#" -gt 0 ]; do
+    root="$(decode_b64 "$1")"
+    resolved_root="$(readlink -f -- "$root" 2>/dev/null || true)"
+    if [ -n "$resolved_root" ]; then
+      case "$actual" in
+        "$resolved_root") return 0 ;;
+        "$resolved_root"/*) return 0 ;;
+      esac
+      [ "$resolved_root" = "/" ] && return 0
+    fi
+    shift
+  done
+  return 1
+}}
+
+run_read_policy() {{
+  path="$(decode_b64 "$1")"
+  shift
+  out_file="$(mktemp)"
+  err_file="$(mktemp)"
+  code=0
+  if exec 3< "$path"; then
+    if path_allowed_fd 3 "$@"; then
+      cat <&3 >"$out_file" 2>"$err_file" || code=$?
+    else
+      printf 'agent policy denied resolved read path: %s\n' "$path" >"$err_file"
+      code=77
+    fi
+    exec 3<&-
+  else
+    printf 'cannot open remote path: %s\n' "$path" >"$err_file"
+    code=1
+  fi
+  emit_result "$code" "$out_file" "$err_file"
+  rm -f "$out_file" "$err_file"
+}}
+
 run_write() {{
   mode="$1"
   path="$(decode_b64 "$2")"
@@ -143,6 +186,65 @@ run_write() {{
   rm -f "$out_file" "$err_file" "$input_file"
 }}
 
+run_write_policy() {{
+  mode="$1"
+  path="$(decode_b64 "$2")"
+  shift 2
+  out_file="$(mktemp)"
+  err_file="$(mktemp)"
+  input_file="$(mktemp)"
+  cat >"$input_file"
+  parent="$(dirname "$path")"
+  base="$(basename "$path")"
+  code=0
+
+  if [ ! -d "$parent" ] || ! exec 4< "$parent"; then
+    printf 'policy write requires an existing parent directory: %s\n' "$parent" >"$err_file"
+    code=77
+  elif ! path_allowed_fd 4 "$@"; then
+    printf 'agent policy denied resolved write parent: %s\n' "$parent" >"$err_file"
+    code=77
+  else
+    target="/proc/$$/fd/4/$base"
+    case "$mode" in
+      create)
+        set -C
+        if ! exec 3> "$target"; then
+          printf 'target already exists: %s\n' "$path" >"$err_file"
+          code=17
+        fi
+        ;;
+      truncate|append)
+        if ! exec 3>> "$target"; then
+          printf 'cannot open remote path: %s\n' "$path" >"$err_file"
+          code=1
+        fi
+        ;;
+      *)
+        printf 'unsupported write mode: %s\n' "$mode" >"$err_file"
+        code=64
+        ;;
+    esac
+    if [ "$code" = "0" ] && ! path_allowed_fd 3 "$@"; then
+      printf 'agent policy denied resolved write path: %s\n' "$path" >"$err_file"
+      code=77
+    fi
+    if [ "$code" = "0" ]; then
+      if [ "$mode" = "truncate" ]; then
+        : > "/proc/$$/fd/3"
+      fi
+      cat "$input_file" >&3 2>>"$err_file" || code=$?
+    fi
+    exec 3>&- 2>/dev/null || true
+    exec 4<&- 2>/dev/null || true
+  fi
+  if [ "$code" = "0" ]; then
+    wc -c <"$input_file" | tr -d ' ' >"$out_file"
+  fi
+  emit_result "$code" "$out_file" "$err_file"
+  rm -f "$out_file" "$err_file" "$input_file"
+}}
+
 case "${{1:-}}" in
   version|--version)
     printf '%s\n' "$SSH_GATEWAYD_VERSION"
@@ -155,9 +257,17 @@ case "${{1:-}}" in
     shift
     run_read "$@"
     ;;
+  read-policy)
+    shift
+    run_read_policy "$@"
+    ;;
   write)
     shift
     run_write "$@"
+    ;;
+  write-policy)
+    shift
+    run_write_policy "$@"
     ;;
   *)
     echo "unknown command: $1" >&2
@@ -166,4 +276,68 @@ case "${{1:-}}" in
 esac
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_revision_forces_remote_agent_refresh() {
+        assert_eq!(expected_version("1.2.3"), "1.2.3+policy-fd-v1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_file_operations_reject_symlink_escape_without_modifying_target() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+
+        let temp =
+            std::env::temp_dir().join(format!("ssh-gateway-policy-{}", uuid::Uuid::new_v4()));
+        let allowed = temp.join("allowed");
+        let outside = temp.join("outside");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, b"original").unwrap();
+        let link = allowed.join("escape.txt");
+        symlink(&outside_file, &link).unwrap();
+        let agent = temp.join("agent.sh");
+        fs::write(&agent, render_agent_script("test")).unwrap();
+
+        let mut read_command = Command::new("sh");
+        read_command
+            .arg(&agent)
+            .arg("read-policy")
+            .arg(BASE64.encode(link.as_os_str().as_encoded_bytes()))
+            .arg(BASE64.encode(allowed.as_os_str().as_encoded_bytes()));
+        let read = read_command.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&read.stdout).lines().next(),
+            Some("77")
+        );
+
+        let mut write_command = Command::new("sh");
+        write_command
+            .arg(&agent)
+            .arg("write-policy")
+            .arg("truncate")
+            .arg(BASE64.encode(link.as_os_str().as_encoded_bytes()))
+            .arg(BASE64.encode(allowed.as_os_str().as_encoded_bytes()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut write = write_command.spawn().unwrap();
+        write.stdin.take().unwrap().write_all(b"modified").unwrap();
+        let write = write.wait_with_output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&write.stdout).lines().next(),
+            Some("77")
+        );
+        assert_eq!(fs::read(&outside_file).unwrap(), b"original");
+        fs::remove_dir_all(temp).unwrap();
+    }
 }

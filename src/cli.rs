@@ -2,7 +2,9 @@ use crate::config::{config_path_display, AppConfig};
 use crate::daemon::DaemonState;
 use crate::errors::ArrtError;
 use crate::ipc;
-use crate::protocol::{CommandResult, EnvVar, ErrorPayload, Request, RpcRequest, WriteMode};
+use crate::protocol::{
+    CallerType, CommandResult, EnvVar, ErrorPayload, Request, RpcRequest, WriteMode,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
@@ -15,6 +17,9 @@ use tokio::fs;
 #[command(about = "Agent Remote Runtime CLI")]
 #[command(version)]
 pub struct Cli {
+    /// Apply profile agent policy to this invocation.
+    #[arg(long, global = true)]
+    pub agent: bool,
     #[command(subcommand)]
     pub command: TopLevelCommand,
 }
@@ -30,6 +35,8 @@ pub enum TopLevelCommand {
     Download(DownloadCommand),
     Tunnel(TunnelCommand),
     Session(SessionCommand),
+    Mcp(McpCommand),
+    Serve(ServeCommand),
 }
 
 #[derive(Args, Debug)]
@@ -146,6 +153,9 @@ pub enum TunnelSubcommand {
     Close {
         #[arg(long = "id")]
         tunnel_id: String,
+        /// Required with --agent so the tunnel policy can be verified.
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -176,6 +186,11 @@ pub async fn dispatch(cli: Cli) -> CommandResult {
 }
 
 async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
+    let caller = if cli.agent {
+        CallerType::AgentCli
+    } else {
+        CallerType::HumanCli
+    };
     match cli.command {
         TopLevelCommand::Daemon(daemon) => dispatch_daemon(daemon).await,
         TopLevelCommand::Profile(command) => {
@@ -184,7 +199,7 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 ProfileSubcommand::Show { name } => Request::ProfileShow { name },
                 ProfileSubcommand::Validate { name } => Request::ProfileValidate { name },
             };
-            send_request(request, true).await
+            send_request(request, caller, true).await
         }
         TopLevelCommand::Exec(command) => {
             let env = command
@@ -210,7 +225,7 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 timeout_seconds,
                 env,
             };
-            send_request(request, true).await
+            send_request(request, caller, true).await
         }
         TopLevelCommand::Read(command) => {
             send_request(
@@ -218,6 +233,7 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                     profile: command.profile,
                     path: command.path,
                 },
+                caller,
                 true,
             )
             .await
@@ -236,17 +252,18 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                     mode,
                     content_b64: BASE64.encode(content),
                 },
+                caller,
                 true,
             )
             .await
         }
         TopLevelCommand::Upload(command) => {
             let request = upload_request(command)?;
-            send_request(request, true).await
+            send_request(request, caller, true).await
         }
         TopLevelCommand::Download(command) => {
             let request = download_request(command)?;
-            send_request(request, true).await
+            send_request(request, caller, true).await
         }
         TopLevelCommand::Tunnel(command) => match command.command {
             TunnelSubcommand::Open {
@@ -262,23 +279,40 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                         remote_host,
                         remote_port,
                     },
+                    caller,
                     true,
                 )
                 .await
             }
-            TunnelSubcommand::Close { tunnel_id } => {
-                send_request(Request::TunnelClose { tunnel_id }, true).await
+            TunnelSubcommand::Close { tunnel_id, profile } => {
+                send_request(Request::TunnelClose { tunnel_id, profile }, caller, true).await
             }
         },
         TopLevelCommand::Session(command) => match command.command {
-            SessionSubcommand::List => send_request(Request::SessionList, true).await,
+            SessionSubcommand::List => send_request(Request::SessionList, caller, true).await,
             SessionSubcommand::Inspect { session_id } => {
-                send_request(Request::SessionInspect { session_id }, true).await
+                send_request(Request::SessionInspect { session_id }, caller, true).await
             }
             SessionSubcommand::Close { session_id } => {
-                send_request(Request::SessionClose { session_id }, true).await
+                send_request(Request::SessionClose { session_id }, caller, true).await
             }
         },
+        TopLevelCommand::Mcp(command) => match command.command {
+            McpSubcommand::Serve { listen } => {
+                crate::mcp::serve(listen).await?;
+                Ok(CommandResult::success().with_data(json!({"status":"stopped"})))
+            }
+        },
+        TopLevelCommand::Serve(command) => {
+            let service = crate::service::GatewayService::new();
+            let daemon = DaemonState::with_service(service.clone());
+            tokio::select! {
+                result = daemon.serve() => result?,
+                result = crate::mcp::serve_with_service(service.clone(), command.listen) => result?,
+            }
+            service.shutdown().await;
+            Ok(CommandResult::success().with_data(json!({"status":"stopped"})))
+        }
     }
 }
 
@@ -308,8 +342,12 @@ async fn dispatch_daemon(command: DaemonCommand) -> Result<CommandResult, ArrtEr
     }
 }
 
-async fn send_request(request: Request, auto_start: bool) -> Result<CommandResult, ArrtError> {
-    let req = rpc(request);
+async fn send_request(
+    request: Request,
+    caller: CallerType,
+    auto_start: bool,
+) -> Result<CommandResult, ArrtError> {
+    let req = rpc_with_caller(request, caller);
     match ipc::send(&req).await {
         Ok(response) => Ok(response.result),
         Err(_err) if auto_start => {
@@ -342,8 +380,35 @@ async fn stop_daemon() -> Result<CommandResult, ArrtError> {
 }
 
 fn rpc(request: Request) -> RpcRequest {
+    rpc_with_caller(request, CallerType::HumanCli)
+}
+
+#[derive(Args, Debug)]
+pub struct McpCommand {
+    #[command(subcommand)]
+    pub command: McpSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpSubcommand {
+    Serve {
+        /// Override the configured listen address. Defaults to 127.0.0.1:8765.
+        #[arg(long)]
+        listen: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct ServeCommand {
+    /// Override the configured MCP listen address.
+    #[arg(long)]
+    listen: Option<String>,
+}
+
+fn rpc_with_caller(request: Request, caller: CallerType) -> RpcRequest {
     RpcRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
+        caller,
         request,
     }
 }
@@ -538,6 +603,31 @@ mod tests {
 
         let short = Cli::try_parse_from(["ssh-gateway", "-V"]).unwrap_err();
         assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn agent_flag_is_global_and_compatible_with_requested_position() {
+        let before = Cli::try_parse_from([
+            "ssh-gateway",
+            "--agent",
+            "exec",
+            "--profile",
+            "test",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let after = Cli::try_parse_from([
+            "ssh-gateway",
+            "exec",
+            "--agent",
+            "--profile",
+            "test",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        assert!(before.agent && after.agent);
     }
 
     #[test]

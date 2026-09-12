@@ -5,6 +5,7 @@
 
 profiles:
   - name: direct-with-bastion
+    description: Production host reached through the managed bastion chain
     target:
       host: target.internal
       user: root
@@ -35,6 +36,24 @@ profiles:
     keepalive:
       interval_seconds: 30
       count_max: 3
+    agent_policy:
+      capabilities:
+        exec: true
+        read: true
+        write: true
+        upload: true
+        download: true
+        tunnel: false
+      allowed_read_paths:
+        - /home
+        - /var/log
+        - /etc/nginx
+      allowed_write_paths:
+        - /home
+      # Agent exec is exact-match allowlisted; shell blacklist parsing is not safe.
+      allowed_commands:
+        - docker ps
+        - systemctl status nginx
 
   - name: upstream-bastion
     target:
@@ -56,3 +75,13 @@ profiles:
       port: 22
     remote:
       shell: bash -lc
+
+mcp:
+  listen: 127.0.0.1:8765
+  auth:
+    type: bearer
+    token_env: SSH_GATEWAY_MCP_TOKEN
+  # Required only for MCP upload_file/download_file. Keep it narrowly scoped.
+  local_file_root: /data
+  # Add the public HTTPS origin here when a browser-originating MCP client sends Origin.
+  allowed_origins: []

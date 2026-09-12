@@ -24,6 +24,7 @@ Use these checks before any remote action:
 ```text
 ssh-gateway profile validate
 ssh-gateway profile validate <profile>
+ssh-gateway profile list
 ssh-gateway daemon status
 ssh-gateway --version
 ```
@@ -31,15 +32,15 @@ ssh-gateway --version
 ## Common operations
 
 ```text
-ssh-gateway exec --profile <profile> -- hostname
-ssh-gateway exec --profile <profile> --cwd /tmp --timeout 30 -- env
-ssh-gateway read --profile <profile> --path /etc/hostname
-ssh-gateway write --profile <profile> --path /tmp/demo.txt --input hello
-ssh-gateway upload --profile <profile> --src ./local.txt --dst /tmp/local.txt
-ssh-gateway download --profile <profile> --src /tmp/local.txt --dst ./local-copy.txt
-ssh-gateway tunnel open --profile <profile> --local 8080 --remote 127.0.0.1:11434
-ssh-gateway session list
-ssh-gateway session inspect --id <session-id>
+ssh-gateway exec --agent --profile <profile> -- hostname
+ssh-gateway exec --agent --profile <profile> --cwd /tmp --timeout 30 -- env
+ssh-gateway read --agent --profile <profile> --path /etc/hostname
+ssh-gateway write --agent --profile <profile> --path /tmp/demo.txt --input hello
+ssh-gateway upload --agent --profile <profile> --src ./local.txt --dst /tmp/local.txt
+ssh-gateway download --agent --profile <profile> --src /tmp/local.txt --dst ./local-copy.txt
+ssh-gateway tunnel open --agent --profile <profile> --local 8080 --remote 127.0.0.1:11434
+ssh-gateway session list --agent
+ssh-gateway session inspect --agent --id <session-id>
 ```
 
 Relative local paths for `upload --src` and `download --dst` are resolved from the CLI caller's current working directory, not the daemon's working directory. Relative `.` and `..` components are normalized. The daemon rejects relative local paths received directly over RPC with `relative_local_path`.
@@ -78,6 +79,7 @@ unless the command is protected by `--%` or wrapped for a remote shell like `bas
 - `config_error`: the profile or auth configuration is invalid; fix the config instead of bypassing the gateway.
 - `ssh_error`: SSH transport or remote auth failed; inspect the target profile and bastion chain.
 - `agent_error`: the remote helper failed; review remote stderr and try again through the same profile.
+- `policy_denied`: the Agent Policy rejected a capability, command, or remote path; do not bypass it with raw SSH.
 - For passphrase-protected private keys, store the `passphrase` in the profile auth block and retry through the same profile instead of switching to raw `ssh`.
 
 ## Safety reminders

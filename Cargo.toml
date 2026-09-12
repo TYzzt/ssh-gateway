@@ -9,6 +9,7 @@ description = "Agent-facing SSH gateway with reusable embedded SSH sessions, bas
 
 [dependencies]
 base64 = "0.22"
+axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 directories = "5.0"
 russh = { version = "0.60", default-features = false, features = ["ring", "rsa", "flate2"] }
@@ -22,3 +23,6 @@ uuid = { version = "1.15", features = ["serde", "v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

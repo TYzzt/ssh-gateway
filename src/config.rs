@@ -13,6 +13,8 @@ const APP_NAME: &str = "ssh-gateway";
 pub struct AppConfig {
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(skip)]
     source_path: PathBuf,
 }
@@ -20,6 +22,8 @@ pub struct AppConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Profile {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub via_profile: Option<String>,
     pub target: HostEndpoint,
@@ -37,6 +41,62 @@ pub struct Profile {
     pub timeouts: TimeoutConfig,
     #[serde(default)]
     pub keepalive: KeepaliveConfig,
+    #[serde(default)]
+    pub agent_policy: AgentPolicyConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentPolicyConfig {
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+    #[serde(default)]
+    pub allowed_read_paths: Vec<String>,
+    #[serde(default)]
+    pub allowed_write_paths: Vec<String>,
+    /// Exact shell command strings agents may execute. Empty denies agent exec.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    /// Deprecated insecure blacklist. Non-empty values fail validation.
+    #[serde(default)]
+    pub deny_commands: Vec<String>,
+    #[serde(default = "default_audit_command")]
+    pub audit_command: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentCapabilities {
+    #[serde(default = "default_true")]
+    pub exec: bool,
+    #[serde(default = "default_true")]
+    pub read: bool,
+    #[serde(default = "default_true")]
+    pub write: bool,
+    #[serde(default = "default_true")]
+    pub upload: bool,
+    #[serde(default = "default_true")]
+    pub download: bool,
+    #[serde(default)]
+    pub tunnel: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct McpConfig {
+    #[serde(default = "default_mcp_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub auth: McpAuthConfig,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub local_file_root: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct McpAuthConfig {
+    #[serde(rename = "type", default = "default_auth_type")]
+    pub kind: String,
+    #[serde(default = "default_token_env")]
+    pub token_env: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -114,6 +174,7 @@ pub struct ResolvedProfile {
     pub transport: ResolvedTransport,
     pub agent: AgentConfig,
     pub timeouts: TimeoutConfig,
+    pub keepalive: KeepaliveConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +259,26 @@ fn default_keepalive_count() -> u64 {
     3
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_audit_command() -> bool {
+    true
+}
+
+fn default_mcp_listen() -> String {
+    "127.0.0.1:8765".to_string()
+}
+
+fn default_auth_type() -> String {
+    "bearer".to_string()
+}
+
+fn default_token_env() -> String {
+    "SSH_GATEWAY_MCP_TOKEN".to_string()
+}
+
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
@@ -239,6 +320,52 @@ impl Default for KeepaliveConfig {
         Self {
             interval_seconds: default_keepalive_interval(),
             count_max: default_keepalive_count(),
+        }
+    }
+}
+
+impl Default for AgentCapabilities {
+    fn default() -> Self {
+        Self {
+            exec: true,
+            read: true,
+            write: true,
+            upload: true,
+            download: true,
+            tunnel: false,
+        }
+    }
+}
+
+impl Default for AgentPolicyConfig {
+    fn default() -> Self {
+        Self {
+            capabilities: AgentCapabilities::default(),
+            allowed_read_paths: Vec::new(),
+            allowed_write_paths: Vec::new(),
+            allowed_commands: Vec::new(),
+            deny_commands: Vec::new(),
+            audit_command: true,
+        }
+    }
+}
+
+impl Default for McpAuthConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_auth_type(),
+            token_env: default_token_env(),
+        }
+    }
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_mcp_listen(),
+            auth: McpAuthConfig::default(),
+            allowed_origins: Vec::new(),
+            local_file_root: None,
         }
     }
 }
@@ -407,6 +534,7 @@ impl Profile {
             transport,
             agent: self.agent.clone(),
             timeouts: self.timeouts.clone(),
+            keepalive: self.keepalive.clone(),
         })
     }
 
@@ -435,6 +563,7 @@ impl Profile {
 
         Ok(json!({
             "name": self.name,
+            "description": self.description,
             "via_profile": via_profile,
             "target": target,
             "bastions": self.bastions.iter().enumerate().map(|(index, bastion)| {
@@ -449,6 +578,7 @@ impl Profile {
             "bootstrap": self.bootstrap,
             "timeouts": self.timeouts,
             "keepalive": self.keepalive,
+            "agent_policy": self.agent_policy,
         }))
     }
 
@@ -471,6 +601,25 @@ impl Profile {
         if self.agent.manage && self.agent.remote_path.trim().is_empty() {
             return Err(ArrtError::Config(format!(
                 "profile {} agent.remote_path is empty",
+                self.name
+            )));
+        }
+        for path in self
+            .agent_policy
+            .allowed_read_paths
+            .iter()
+            .chain(&self.agent_policy.allowed_write_paths)
+        {
+            if !path.starts_with('/') {
+                return Err(ArrtError::Config(format!(
+                    "profile {} agent policy path must be absolute: {}",
+                    self.name, path
+                )));
+            }
+        }
+        if !self.agent_policy.deny_commands.is_empty() {
+            return Err(ArrtError::Config(format!(
+                "profile {} agent_policy.deny_commands is not a security boundary; use exact allowed_commands",
                 self.name
             )));
         }
@@ -511,7 +660,7 @@ impl HostEndpoint {
             .auth
             .as_ref()
             .or(fallback_auth)
-            .expect("validated auth exists");
+            .ok_or_else(|| ArrtError::Config(format!("{label} auth is missing")))?;
         Ok(ResolvedEndpoint {
             host: self.host.clone(),
             user: self.user.clone(),
@@ -1086,5 +1235,72 @@ profiles:
         set_base_dir(&mut config);
         config.validate().unwrap();
         assert_eq!(config.profiles[0].name, "vger");
+    }
+
+    #[test]
+    fn legacy_config_gets_safe_agent_and_mcp_defaults() {
+        let raw = r#"
+profiles:
+  - name: legacy
+    target:
+      host: legacy
+      user: root
+      auth:
+        type: password
+        password: secret
+"#;
+        let mut config = parse_config(raw, Path::new("profiles.yaml")).unwrap();
+        set_base_dir(&mut config);
+        config.validate().unwrap();
+        assert!(config.profiles[0].agent_policy.capabilities.exec);
+        assert!(!config.profiles[0].agent_policy.capabilities.tunnel);
+        assert!(config.profiles[0].agent_policy.allowed_commands.is_empty());
+        assert_eq!(config.mcp.listen, "127.0.0.1:8765");
+    }
+
+    #[test]
+    fn rejects_relative_agent_policy_roots() {
+        let raw = r#"
+profiles:
+  - name: bad
+    target:
+      host: bad
+      user: root
+      auth:
+        type: password
+        password: secret
+    agent_policy:
+      allowed_read_paths: [var/log]
+"#;
+        let mut config = parse_config(raw, Path::new("profiles.yaml")).unwrap();
+        set_base_dir(&mut config);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be absolute"));
+    }
+
+    #[test]
+    fn rejects_deprecated_command_blacklist() {
+        let raw = r#"
+profiles:
+  - name: bad
+    target:
+      host: bad
+      user: root
+      auth:
+        type: password
+        password: secret
+    agent_policy:
+      deny_commands: [reboot]
+"#;
+        let mut config = parse_config(raw, Path::new("profiles.yaml")).unwrap();
+        set_base_dir(&mut config);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("use exact allowed_commands"));
     }
 }

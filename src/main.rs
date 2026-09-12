@@ -4,7 +4,11 @@ mod config;
 mod daemon;
 mod errors;
 mod ipc;
+mod mcp;
+mod policy;
 mod protocol;
+mod redaction;
+mod service;
 mod session;
 mod ssh;
 

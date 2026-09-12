@@ -1,6 +1,6 @@
 ---
 name: ssh-gateway
-description: Use the local ssh-gateway CLI to run commands, read files, write files, transfer files, inspect sessions, or open tunnels on remote Linux hosts behind bastions. Trigger when the user wants agent-driven remote access through configured profiles and credentials should stay inside ssh-gateway instead of raw ssh commands, pasted passwords, private keys, or key passphrases.
+description: Use the local ssh-gateway CLI for agent-driven shell, file, transfer, session, and tunnel operations on remote Linux hosts represented by configured profiles. Prefer it over raw ssh/scp/sftp when a profile can hide credentials and routing details.
 ---
 
 # ssh-gateway
@@ -23,8 +23,8 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
    - Otherwise check the bundled installer's default target path first: Windows `"$env:LOCALAPPDATA\ssh-gateway\bin\ssh-gateway.exe"` or Linux `"$HOME/.local/bin/ssh-gateway"`
    - Otherwise run the bundled install script for the current platform and use the installed `binary_path` it prints
    - On Windows, expect the installer to persist the install directory into the user `PATH` for future shells unless explicitly disabled
-2. Validate the profile first with `ssh-gateway profile validate [name]`.
-3. Prefer profile-driven operations:
+2. Run `ssh-gateway profile list`, select the closest matching profile, then validate it with `ssh-gateway profile validate <name>`.
+3. Add `--agent` to remote operations so the profile's Agent Policy is enforced. Prefer:
    - `exec` for commands
    - `read` and `write` for text or file content
    - `upload` and `download` for file transfer
@@ -35,10 +35,11 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
 ## Safe Operating Rules
 
 - Prefer `--profile <name>` over raw hostnames in commands.
+- Do not ask for an IP, password, key, passphrase, bastion, or `via_profile` details when a suitable profile exists.
 - Treat `profile show` and `session inspect` as summaries, not as a way to retrieve secrets.
 - Keep the user on the `ssh-gateway` path whenever a configured profile can satisfy the request.
 - Only fall back to raw `ssh` if the user explicitly asks for it or if no gateway profile can serve the operation.
-- For delegated profiles, expect `tunnel open` to fail by design.
+- Agent tunnels are denied by default and require an explicit profile capability. Delegated profiles still reject tunnels.
 - Do not ask the user to manually download a release asset if the bundled install scripts can do it for them.
 - For passphrase-protected keys, keep the passphrase in the gateway config and out of chat history.
 - When the local shell is Windows PowerShell, do not emit complex Unix command lines directly after `ssh-gateway exec ... --` if they contain shell metacharacters such as `(`, `)`, `*`, `'`, `"`, `|`, `&`, or `;`.

@@ -44,6 +44,9 @@ impl EmbeddedSession {
     pub async fn connect(profile: &ResolvedProfile) -> Result<Self, ArrtError> {
         let config = Arc::new(client::Config {
             nodelay: true,
+            keepalive_interval: (profile.keepalive.interval_seconds > 0)
+                .then(|| Duration::from_secs(profile.keepalive.interval_seconds)),
+            keepalive_max: usize::try_from(profile.keepalive.count_max).unwrap_or(usize::MAX),
             ..Default::default()
         });
 
@@ -131,15 +134,13 @@ impl EmbeddedSession {
                     signal_name,
                     error_message,
                     ..
-                } => {
-                    if stderr.is_empty() {
-                        let message = if error_message.is_empty() {
-                            format!("remote command terminated by signal {:?}", signal_name)
-                        } else {
-                            error_message
-                        };
-                        stderr.extend_from_slice(message.as_bytes());
-                    }
+                } if stderr.is_empty() => {
+                    let message = if error_message.is_empty() {
+                        format!("remote command terminated by signal {:?}", signal_name)
+                    } else {
+                        error_message
+                    };
+                    stderr.extend_from_slice(message.as_bytes());
                 }
                 _ => {}
             }

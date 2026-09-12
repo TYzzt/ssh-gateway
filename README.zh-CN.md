@@ -21,7 +21,7 @@
   <img src="https://img.shields.io/badge/platforms-Windows%20x64%20%7C%20Linux%20x64-0f172a.svg" alt="Supported platforms">
 </p>
 
-`ssh-gateway` 是一个面向智能体的 SSH 网关，适合在带跳板机的 Linux 环境里做远程自动化。它会在本地 daemon 中维护可复用的嵌入式 SSH 会话，把认证材料收敛到 gateway 自己管理的 profile 配置里，让 agent 通过 `profile` 名称操作远端，而不是直接暴露密码或私钥。
+`ssh-gateway` 是一个面向 Agent 的远程主机网关。它为 Codex、ChatGPT、Claude Code、Cursor 和自研 Agent 提供可复用的 embedded SSH session、profile 密钥隔离、跳板路由和策略控制。
 
 它刻意**不是**通用 SSH 客户端替代品；项目的重点是 agent 工作流、profile 驱动的安全边界，以及可重复的远程操作接口。
 
@@ -42,6 +42,10 @@
 - **`via_profile` 委托模式**：当最终目标只能从上游主机访问时，复用上游主机已有的远端 SSH 能力。
 - **托管远端 agent 生命周期**：连接时自动做版本检查、安装和复用。
 - **JSON-only CLI**：统一覆盖 `daemon`、`profile`、`exec`、`read`、`write`、`upload`、`download`、`tunnel`、`session`。
+- **两类 Agent 接口**：本地 Agent 使用 CLI + Skill，远程 Agent 使用 Bearer 认证的 Streamable HTTP MCP。
+- **Agent Policy**：`--agent` CLI 和所有 MCP 调用统一执行 capability、精确命令白名单和远端真实路径限制，旧版 Human CLI 默认行为不变。
+
+Codex 本地接入见 [docs/codex.md](docs/codex.md)，ChatGPT MCP 与 NAS 部署见 [docs/chatgpt.md](docs/chatgpt.md)。
 
 ## 安全模型
 

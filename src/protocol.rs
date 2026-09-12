@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallerType {
+    #[default]
+    HumanCli,
+    AgentCli,
+    Mcp,
+}
+
+impl CallerType {
+    pub fn enforces_agent_policy(self) -> bool {
+        matches!(self, Self::AgentCli | Self::Mcp)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ErrorPayload {
     pub code: String,
@@ -121,6 +136,8 @@ pub enum Request {
     },
     TunnelClose {
         tunnel_id: String,
+        #[serde(default)]
+        profile: Option<String>,
     },
     SessionList,
     SessionInspect {
@@ -134,6 +151,8 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RpcRequest {
     pub request_id: String,
+    #[serde(default)]
+    pub caller: CallerType,
     pub request: Request,
 }
 

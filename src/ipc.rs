@@ -117,6 +117,10 @@ pub async fn serve(state: Arc<DaemonState>) -> Result<(), ArrtError> {
     loop {
         tokio::select! {
             _ = state.shutdown.notified() => break,
+            _ = shutdown_signal() => {
+                state.graceful_shutdown().await;
+                break;
+            },
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted.map_err(ArrtError::from)?;
                 let state = Arc::clone(&state);
@@ -125,6 +129,7 @@ pub async fn serve(state: Arc<DaemonState>) -> Result<(), ArrtError> {
                     if let Ok(request) = request {
                         let should_shutdown = matches!(&request.request, Request::Shutdown);
                         let response = Arc::clone(&state).handle(request).await;
+                        let should_shutdown = should_shutdown && response.result.ok;
                         let _ = write_frame(&mut stream, &response).await;
                         if should_shutdown {
                             state.request_shutdown();
@@ -146,6 +151,10 @@ pub async fn serve(state: Arc<DaemonState>) -> Result<(), ArrtError> {
     loop {
         tokio::select! {
             _ = state.shutdown.notified() => break,
+            _ = shutdown_signal() => {
+                state.graceful_shutdown().await;
+                break;
+            },
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted.map_err(|err| ArrtError::Ipc(err.to_string()))?;
                 let state = Arc::clone(&state);
@@ -154,6 +163,7 @@ pub async fn serve(state: Arc<DaemonState>) -> Result<(), ArrtError> {
                     if let Ok(request) = request {
                         let should_shutdown = matches!(&request.request, Request::Shutdown);
                         let response = Arc::clone(&state).handle(request).await;
+                        let should_shutdown = should_shutdown && response.result.ok;
                         let _ = write_frame(&mut stream, &response).await;
                         if should_shutdown {
                             state.request_shutdown();
@@ -166,6 +176,22 @@ pub async fn serve(state: Arc<DaemonState>) -> Result<(), ArrtError> {
     Ok(())
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +199,7 @@ mod tests {
     fn exec_request(timeout_seconds: u64) -> RpcRequest {
         RpcRequest {
             request_id: "test".to_string(),
+            caller: crate::protocol::CallerType::HumanCli,
             request: Request::Exec {
                 profile: "test".to_string(),
                 command: "true".to_string(),

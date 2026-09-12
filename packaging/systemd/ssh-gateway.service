@@ -1,0 +1,24 @@
+[Unit]
+Description=ssh-gateway agent-facing remote host gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ssh-gateway
+Group=ssh-gateway
+Environment=ARRT_CONFIG_PATH=/etc/ssh-gateway/profiles.yaml
+Environment=XDG_DATA_HOME=/var/lib/ssh-gateway
+EnvironmentFile=-/etc/ssh-gateway/environment
+ExecStart=/usr/local/bin/ssh-gateway serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/ssh-gateway
+StateDirectory=ssh-gateway
+
+[Install]
+WantedBy=multi-user.target

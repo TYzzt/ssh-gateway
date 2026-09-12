@@ -127,7 +127,11 @@ impl SessionManager {
     pub async fn reap_idle_sessions(&mut self, config: &AppConfig) {
         let mut expired = Vec::new();
         for (session_id, session) in &self.sessions {
-            if session.active_operations > 0 {
+            let has_tunnel = self
+                .tunnels
+                .values()
+                .any(|tunnel| tunnel.session_id == *session_id);
+            if session.active_operations > 0 || has_tunnel {
                 continue;
             }
             if let Ok(profile) = config.resolved_profile(&session.profile_name) {
@@ -448,17 +452,22 @@ impl SessionManager {
         config: &AppConfig,
         profile_name: &str,
         path: String,
+        allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
         let session_id = self.ensure_session(config, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
-        let mut result = self
-            .invoke_agent(
-                &session_id,
-                vec!["read".to_string(), BASE64.encode(path)],
-                None,
-            )
-            .await?;
+        let mut args = vec![
+            if allowed_roots.is_empty() {
+                "read"
+            } else {
+                "read-policy"
+            }
+            .to_string(),
+            BASE64.encode(path),
+        ];
+        args.extend(allowed_roots.iter().map(|root| BASE64.encode(root)));
+        let mut result = self.invoke_agent(&session_id, args, None).await?;
         let content_b64 = result
             .data
             .as_ref()
@@ -479,6 +488,7 @@ impl SessionManager {
         path: String,
         mode: WriteMode,
         content_b64: String,
+        allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
         let session_id = self.ensure_session(config, &profile).await?;
@@ -486,17 +496,18 @@ impl SessionManager {
         let content = BASE64
             .decode(content_b64.as_bytes())
             .map_err(|err| ArrtError::InvalidArgument(format!("invalid content_b64: {err}")))?;
-        let mut result = self
-            .invoke_agent(
-                &session_id,
-                vec![
-                    "write".to_string(),
-                    write_mode_name(mode).to_string(),
-                    BASE64.encode(path),
-                ],
-                Some(&content),
-            )
-            .await?;
+        let mut args = vec![
+            if allowed_roots.is_empty() {
+                "write"
+            } else {
+                "write-policy"
+            }
+            .to_string(),
+            write_mode_name(mode).to_string(),
+            BASE64.encode(path),
+        ];
+        args.extend(allowed_roots.iter().map(|root| BASE64.encode(root)));
+        let mut result = self.invoke_agent(&session_id, args, Some(&content)).await?;
         result.session_id = Some(session_id);
         Ok(result)
     }
@@ -507,6 +518,7 @@ impl SessionManager {
         profile_name: &str,
         src: String,
         dst: String,
+        allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
         let src = absolute_local_path(src, "upload src")?;
         let content = fs::read(&src).await?;
@@ -517,6 +529,7 @@ impl SessionManager {
                 dst.clone(),
                 WriteMode::Truncate,
                 BASE64.encode(content),
+                allowed_roots,
             )
             .await?;
         add_transfer_paths(
@@ -535,9 +548,12 @@ impl SessionManager {
         profile_name: &str,
         src: String,
         dst: String,
+        allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
         let dst = absolute_local_path(dst, "download dst")?;
-        let mut result = self.read(config, profile_name, src.clone()).await?;
+        let mut result = self
+            .read(config, profile_name, src.clone(), allowed_roots)
+            .await?;
         if !result.ok {
             add_transfer_paths(
                 &mut result,
@@ -671,6 +687,13 @@ impl SessionManager {
         Ok(result)
     }
 
+    pub fn tunnel_profile(&self, tunnel_id: &str) -> Option<&str> {
+        let tunnel = self.tunnels.get(tunnel_id)?;
+        self.sessions
+            .get(&tunnel.session_id)
+            .map(|session| session.profile_name.as_str())
+    }
+
     fn session_summary(&self, session: &SessionInfo) -> serde_json::Value {
         json!({
             "session_id": session.session_id,
@@ -800,6 +823,7 @@ fn classify_remote_cwd_error(result: &mut CommandResult, cwd: Option<&str>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod local_path_tests {
     use super::*;
 
@@ -861,6 +885,17 @@ mod local_path_tests {
 
         assert_eq!(result.error.unwrap().code, "remote_cwd_not_found");
         assert_eq!(result.data.unwrap()["remote_cwd"], "/missing/path");
+    }
+
+    #[test]
+    fn remote_policy_exit_is_reported_as_policy_denied() {
+        let output = CommandOutput {
+            exit_code: 0,
+            stdout: format!("77\n\n{}\n", BASE64.encode("resolved path escaped")).into_bytes(),
+            stderr: Vec::new(),
+        };
+        let result = parse_agent_output(output).unwrap();
+        assert_eq!(result.error.unwrap().code, "policy_denied");
     }
 }
 
@@ -977,7 +1012,12 @@ fn parse_agent_output(output: CommandOutput) -> Result<CommandResult, ArrtError>
     }));
     if !result.ok {
         result.error = Some(ErrorPayload {
-            code: "remote_command_failed".to_string(),
+            code: if exit_code == 77 {
+                "policy_denied"
+            } else {
+                "remote_command_failed"
+            }
+            .to_string(),
             message: if stderr.is_empty() {
                 format!("remote command exited with {}", exit_code)
             } else {

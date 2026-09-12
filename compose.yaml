@@ -1,0 +1,19 @@
+services:
+  ssh-gateway:
+    build: .
+    image: ssh-gateway:local
+    restart: unless-stopped
+    # Explicit container bind; the published host port remains loopback-only below.
+    command: ["serve", "--listen", "0.0.0.0:8765"]
+    environment:
+      ARRT_CONFIG_PATH: /config/profiles.yaml
+      SSH_GATEWAY_MCP_TOKEN: ${SSH_GATEWAY_MCP_TOKEN:?set SSH_GATEWAY_MCP_TOKEN}
+    volumes:
+      - ./config:/config:ro
+      - ./keys:/keys:ro
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777

@@ -21,7 +21,7 @@
   <img src="https://img.shields.io/badge/platforms-Windows%20x64%20%7C%20Linux%20x64-0f172a.svg" alt="Supported platforms">
 </p>
 
-`ssh-gateway` is an agent-facing SSH gateway for remote Linux automation behind bastions. It keeps reusable embedded SSH sessions inside a local daemon, moves authentication material into gateway-managed profiles, and lets agents operate by `profile` name instead of raw passwords or keys.
+`ssh-gateway` is an agent-facing remote host gateway. It provides reusable embedded SSH sessions, profile-based secret isolation, bastion routing, and policy-controlled remote operations for Codex, ChatGPT, Claude Code, Cursor, and custom agents.
 
 It is intentionally **not** a general-purpose SSH client replacement. The project is optimized for agent workflows, profile-driven safety, and repeatable remote operations.
 
@@ -42,6 +42,8 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 - **Delegated `via_profile` mode**: reuse an upstream host's remote SSH capability when the final target is only reachable from that host.
 - **Managed remote agent lifecycle**: version checks, bootstrap, and reuse happen on connect.
 - **JSON-only CLI**: predictable automation surface for `daemon`, `profile`, `exec`, `read`, `write`, `upload`, `download`, `tunnel`, and `session`.
+- **Two agent interfaces**: local agents use CLI + Skill; remote agents use the bearer-authenticated Streamable HTTP MCP server.
+- **Agent Policy**: capability gates, exact command allowlists, and remotely resolved path restrictions apply to `--agent` CLI calls and every MCP call without changing legacy human CLI behavior.
 
 ## Security Model
 
@@ -72,6 +74,14 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 <p align="center">
   <img src="docs/readme/architecture.svg" alt="Agent to daemon to embedded SSH to bastion and target flow" width="100%">
 </p>
+
+```text
+Local Agent -> Skill -> CLI -> daemon RPC --+
+                                                +-> GatewayService -> SessionManager -> embedded SSH
+Remote Agent ------------> MCP Server --------+
+```
+
+Profiles remain location-transparent: direct, bastion, and `via_profile` routing can change without changing Agent calls.
 
 1. Download a release asset from [GitHub Releases](https://github.com/TYzzt/ssh-gateway/releases) and place `ssh-gateway` on your `PATH`.
 2. Prepare a profile file. YAML is preferred; start from [examples/profiles.yaml](examples/profiles.yaml).
@@ -203,6 +213,8 @@ Operational commands print JSON. Standard `--help` and `--version` output plain 
 | remote ops | `exec`, `read`, `write`, `upload`, `download` |
 | `tunnel` | `tunnel open --profile <name> --local <port> --remote <host:port>`, `tunnel close --id <tunnel-id>` |
 | `session` | `session list`, `session inspect --id <session-id>`, `session close --id <session-id>` |
+| `mcp` | `mcp serve [--listen 127.0.0.1:8765]` |
+| combined service | `serve [--listen 127.0.0.1:8765]` |
 
 Common examples:
 
@@ -214,6 +226,8 @@ ssh-gateway upload --profile delegated-target --src ./local.txt --dst /tmp/local
 ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
 ```
+
+Local agents add `--agent`, for example `ssh-gateway exec --agent --profile aliyun -- docker ps`. See [Codex setup](docs/codex.md), [ChatGPT MCP setup](docs/chatgpt.md), and [NAS compose deployment](compose.yaml).
 
 Relative local paths are resolved from the CLI caller's current working directory. This applies to `upload --src` and `download --dst`; the daemon rejects relative local paths at the RPC boundary and never resolves them from its own working directory. `.` and `..` in relative local paths are normalized before the request is sent. Windows drive-letter and UNC absolute paths are preserved.
 
