@@ -1,8 +1,34 @@
-use crate::config::{AgentPolicyConfig, AppConfig};
+use crate::config::{AgentPolicyConfig, AppConfig, PolicyEffectConfig, RiskLevelConfig};
 use crate::errors::ArrtError;
 use crate::protocol::{CallerType, Request};
 
 pub struct PolicyEngine;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyEffect {
+    Allow,
+    Confirm,
+    Deny,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyDecision {
+    pub effect: PolicyEffect,
+    pub rule_id: Option<String>,
+    pub reason: Option<String>,
+    pub risk: Option<RiskLevelConfig>,
+}
+
+impl PolicyDecision {
+    fn allow() -> Self {
+        Self {
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: None,
+            risk: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Capability {
@@ -28,48 +54,57 @@ impl PolicyEngine {
         config: &AppConfig,
         caller: CallerType,
         request: &Request,
-    ) -> Result<(), ArrtError> {
+    ) -> Result<PolicyDecision, ArrtError> {
         Self::authorize_caller(caller, request)?;
         if !caller.enforces_agent_policy() {
-            return Ok(());
+            return Ok(PolicyDecision::allow());
         }
 
-        match request {
+        let policy = match request {
             Request::Exec {
                 profile,
                 command,
                 cwd,
                 ..
             } => {
-                let policy = &config.profile(profile)?.agent_policy;
+                let profile_config = config.profile(profile)?;
+                let policy = &profile_config.agent_policy;
                 require_capability(policy, Capability::Exec)?;
-                require_allowed_command(policy, command)?;
+                if policy.rules.is_empty() || !policy.allowed_commands.is_empty() {
+                    require_allowed_command(policy, command)?;
+                }
                 if let Some(cwd) = cwd {
                     require_path(policy, cwd, false)?;
                 }
+                Some(profile_config.agent_policy)
             }
             Request::Read { profile, path } => {
                 let policy = &config.profile(profile)?.agent_policy;
                 require_capability(policy, Capability::Read)?;
                 require_path(policy, path, false)?;
+                Some(policy.clone())
             }
             Request::Write { profile, path, .. } => {
                 let policy = &config.profile(profile)?.agent_policy;
                 require_capability(policy, Capability::Write)?;
                 require_path(policy, path, true)?;
+                Some(policy.clone())
             }
             Request::Upload { profile, dst, .. } => {
                 let policy = &config.profile(profile)?.agent_policy;
                 require_capability(policy, Capability::Upload)?;
                 require_path(policy, dst, true)?;
+                Some(policy.clone())
             }
             Request::Download { profile, src, .. } => {
                 let policy = &config.profile(profile)?.agent_policy;
                 require_capability(policy, Capability::Download)?;
                 require_path(policy, src, false)?;
+                Some(policy.clone())
             }
             Request::TunnelOpen { profile, .. } => {
                 require_capability(&config.profile(profile)?.agent_policy, Capability::Tunnel)?;
+                None
             }
             Request::TunnelClose { profile, .. } => {
                 let profile = profile.as_deref().ok_or_else(|| {
@@ -78,17 +113,91 @@ impl PolicyEngine {
                     )
                 })?;
                 require_capability(&config.profile(profile)?.agent_policy, Capability::Tunnel)?;
+                None
             }
-            Request::SessionClose { .. } | Request::SessionInspect { .. } => {}
+            Request::ApprovalApprove { .. } | Request::ApprovalReject { .. } => {
+                return Err(ArrtError::PolicyDenied(
+                    "agents cannot approve or reject approvals".to_string(),
+                ))
+            }
+            Request::ApprovalList | Request::ApprovalShow { .. } | Request::ApprovalCleanup => {
+                return Err(ArrtError::PolicyDenied(
+                    "approval administration requires Human CLI".to_string(),
+                ))
+            }
+            Request::SessionClose { .. } | Request::SessionInspect { .. } => None,
             Request::SessionList
             | Request::Ping
             | Request::ProfileList
             | Request::ProfileShow { .. }
-            | Request::ProfileValidate { .. } => {}
-            Request::Shutdown => {}
+            | Request::ProfileValidate { .. } => None,
+            Request::Shutdown => None,
+        };
+        let Some(policy) = policy else {
+            return Ok(PolicyDecision::allow());
+        };
+        if policy.rules.is_empty() {
+            return Ok(PolicyDecision::allow());
         }
-        Ok(())
+        for rule in &policy.rules {
+            if rule_matches(rule, request) {
+                return Ok(PolicyDecision {
+                    effect: match rule.effect {
+                        PolicyEffectConfig::Allow => PolicyEffect::Allow,
+                        PolicyEffectConfig::Confirm => PolicyEffect::Confirm,
+                        PolicyEffectConfig::Deny => PolicyEffect::Deny,
+                    },
+                    rule_id: Some(rule.id.clone()),
+                    reason: rule.reason.clone(),
+                    risk: rule.risk,
+                });
+            }
+        }
+        Ok(PolicyDecision {
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: Some("no policy rule matched".into()),
+            risk: None,
+        })
     }
+}
+
+fn rule_matches(rule: &crate::config::PolicyRuleConfig, request: &Request) -> bool {
+    let (operation, value, patterns) = match request {
+        Request::Exec { command, .. } => ("exec", command.as_str(), &rule.matcher.commands),
+        Request::Read { path, .. } => ("read", path.as_str(), &rule.matcher.paths),
+        Request::Write { path, .. } => ("write", path.as_str(), &rule.matcher.paths),
+        Request::Upload { dst, .. } => ("upload", dst.as_str(), &rule.matcher.paths),
+        Request::Download { src, .. } => ("download", src.as_str(), &rule.matcher.paths),
+        _ => return false,
+    };
+    rule.matcher.operation == operation && patterns.iter().any(|p| wildcard_match(p, value))
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let (mut p, mut v, mut star, mut mark) = (0, 0, None, 0);
+    let pb = pattern.as_bytes();
+    let vb = value.as_bytes();
+    while v < vb.len() {
+        if p < pb.len() && pb[p] == vb[v] {
+            p += 1;
+            v += 1;
+        } else if p < pb.len() && pb[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            mark = v;
+        } else if let Some(s) = star {
+            p = s + 1;
+            mark += 1;
+            v = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pb.len() && pb[p] == b'*' {
+        p += 1;
+    }
+    p == pb.len()
 }
 
 fn require_capability(policy: &AgentPolicyConfig, capability: Capability) -> Result<(), ArrtError> {
@@ -222,5 +331,66 @@ profiles:
         assert!(PolicyEngine::authorize(&config, CallerType::AgentCli, &request).is_err());
         assert!(PolicyEngine::authorize(&config, CallerType::Mcp, &request).is_err());
         assert!(PolicyEngine::authorize(&config, CallerType::HumanCli, &request).is_ok());
+    }
+
+    #[test]
+    fn wildcard_is_anchored_and_does_not_unwrap_shells() {
+        assert!(wildcard_match(
+            "systemctl restart *",
+            "systemctl restart nginx"
+        ));
+        assert!(!wildcard_match(
+            "systemctl restart *",
+            "bash -c systemctl restart nginx"
+        ));
+    }
+
+    #[test]
+    fn rules_return_all_three_effects() {
+        let config: AppConfig = serde_yaml::from_str(r#"
+profiles:
+- name: test
+  target: {host: example, user: root, auth: {type: password, password: secret}}
+  agent_policy:
+    rules:
+    - {id: allow-status, match: {operation: exec, commands: ['systemctl status *']}, effect: allow, risk: low}
+    - {id: confirm-restart, match: {operation: exec, commands: ['systemctl restart *']}, effect: confirm, risk: medium}
+    - {id: deny-reboot, match: {operation: exec, commands: [reboot]}, effect: deny, risk: critical}
+"#).unwrap();
+        let make = |command: &str| Request::Exec {
+            profile: "test".into(),
+            command: command.into(),
+            cwd: None,
+            timeout_seconds: Some(30),
+            env: vec![],
+        };
+        assert_eq!(
+            PolicyEngine::authorize(&config, CallerType::Mcp, &make("systemctl status nginx"))
+                .unwrap()
+                .effect,
+            PolicyEffect::Allow
+        );
+        assert_eq!(
+            PolicyEngine::authorize(&config, CallerType::Mcp, &make("systemctl restart nginx"))
+                .unwrap()
+                .effect,
+            PolicyEffect::Confirm
+        );
+        assert_eq!(
+            PolicyEngine::authorize(&config, CallerType::Mcp, &make("reboot"))
+                .unwrap()
+                .effect,
+            PolicyEffect::Deny
+        );
+        assert_eq!(
+            PolicyEngine::authorize(
+                &config,
+                CallerType::Mcp,
+                &make("bash -c 'systemctl restart nginx'")
+            )
+            .unwrap()
+            .effect,
+            PolicyEffect::Deny
+        );
     }
 }

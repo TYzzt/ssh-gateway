@@ -1,4 +1,11 @@
 # Preferred YAML config format.
+approval:
+  enabled: true
+  ttl_seconds: 300
+  storage:
+    type: sqlite
+    path: /data/approvals.db
+
 # This file shows both supported transport styles:
 # 1. direct SSH with gateway-managed bastion auth
 # 2. delegated via_profile reuse

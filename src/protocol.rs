@@ -82,7 +82,7 @@ pub struct EnvVar {
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum WriteMode {
     Create,
     Truncate,
@@ -146,6 +146,17 @@ pub enum Request {
     SessionClose {
         session_id: String,
     },
+    ApprovalList,
+    ApprovalShow {
+        approval_id: String,
+    },
+    ApprovalApprove {
+        approval_id: String,
+    },
+    ApprovalReject {
+        approval_id: String,
+    },
+    ApprovalCleanup,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

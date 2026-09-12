@@ -1,6 +1,7 @@
+use crate::approval::{request_hash, ApprovalService};
 use crate::config::{config_path_display, AppConfig};
 use crate::errors::ArrtError;
-use crate::policy::PolicyEngine;
+use crate::policy::{PolicyEffect, PolicyEngine};
 use crate::protocol::{CallerType, CommandResult, ErrorPayload, Request};
 use crate::redaction::SecretRedactor;
 use crate::session::{absolute_local_path, SessionManager};
@@ -135,12 +136,39 @@ impl GatewayService {
         let mut result = match config {
             Ok(config) => {
                 let redactor = SecretRedactor::from_config(&config);
-                let result = match PolicyEngine::authorize(&config, caller, &request) {
-                    Ok(()) => {
-                        self.execute_authorized(&config, caller, request.clone())
-                            .await
+                let result = if matches!(
+                    request,
+                    Request::ApprovalList
+                        | Request::ApprovalShow { .. }
+                        | Request::ApprovalApprove { .. }
+                        | Request::ApprovalReject { .. }
+                        | Request::ApprovalCleanup
+                ) {
+                    self.execute_approval(&config, caller, request.clone())
+                        .await
+                } else {
+                    match PolicyEngine::authorize(&config, caller, &request) {
+                        Ok(decision) if decision.effect == PolicyEffect::Allow => {
+                            self.execute_authorized(&config, caller, request.clone())
+                                .await
+                        }
+                    Ok(decision) if decision.effect == PolicyEffect::Confirm => {
+                        ApprovalService::from_config(&config).and_then(|service| service.create(
+                            &request, caller, decision.rule_id.as_deref(), decision.reason.as_deref(), decision.risk, &redactor
+                        )).map(|approval| {
+                            let mut audit_metadata=approval.clone();
+                            if let Some(object)=audit_metadata.as_object_mut(){object.insert("rule".into(),json!(decision.rule_id));}
+                            audit_approval("approval_created", &audit_metadata, caller);
+                            CommandResult::success().with_data(json!({"status":"confirmation_required","approval":approval}))
+                        })
+                        }
+                        Ok(decision) => Err(ArrtError::PolicyDenied(
+                            decision
+                                .reason
+                                .unwrap_or_else(|| "policy rule denied operation".into()),
+                        )),
+                        Err(err) => Err(err),
                     }
-                    Err(err) => Err(err),
                 };
                 let mut result = result.unwrap_or_else(|err| error_result(err, &request));
                 redact_result(&redactor, &mut result);
@@ -155,6 +183,88 @@ impl GatewayService {
             result.duration_ms = Some(started.elapsed().as_millis());
         }
         result
+    }
+
+    async fn execute_approval(
+        &self,
+        config: &AppConfig,
+        caller: CallerType,
+        request: Request,
+    ) -> Result<CommandResult, ArrtError> {
+        if caller != CallerType::HumanCli {
+            return Err(ArrtError::PolicyDenied(
+                "approval administration requires Human CLI".into(),
+            ));
+        }
+        let approvals = ApprovalService::from_config(config)?;
+        match request {
+            Request::ApprovalList => {
+                Ok(CommandResult::success().with_data(json!({"approvals":approvals.list()?})))
+            }
+            Request::ApprovalShow { approval_id } => Ok(CommandResult::success()
+                .with_data(json!({"approval":approvals.show(&approval_id)?}))),
+            Request::ApprovalReject { approval_id } => {
+                let data = approvals.reject(&approval_id)?;
+                audit_approval("approval_rejected", &approvals.show(&approval_id)?, caller);
+                Ok(CommandResult::success().with_data(data))
+            }
+            Request::ApprovalCleanup => {
+                Ok(CommandResult::success().with_data(approvals.cleanup()?))
+            }
+            Request::ApprovalApprove { approval_id } => {
+                let claim = approvals.claim(&approval_id)?;
+                let current_hash = request_hash(&claim.request);
+                if current_hash.as_ref().is_err_and(|_| true)
+                    || current_hash.is_ok_and(|hash| hash != claim.request_hash)
+                {
+                    let failed = error_result(
+                        ArrtError::Approval("request changed after approval creation".into()),
+                        &claim.request,
+                    );
+                    approvals.finish(&claim.id, &failed)?;
+                    return Ok(failed);
+                }
+                let decision = match PolicyEngine::authorize(config, claim.caller, &claim.request) {
+                    Ok(decision) => decision,
+                    Err(err) => {
+                        let failed = error_result(err, &claim.request);
+                        approvals.finish(&claim.id, &failed)?;
+                        return Ok(failed);
+                    }
+                };
+                if decision.effect == PolicyEffect::Deny {
+                    let failed = error_result(
+                        ArrtError::PolicyDenied(
+                            decision
+                                .reason
+                                .unwrap_or_else(|| "policy now denies operation".into()),
+                        ),
+                        &claim.request,
+                    );
+                    approvals.finish(&claim.id, &failed)?;
+                    return Ok(failed);
+                }
+                audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
+                let mut result = self
+                    .execute_authorized(config, claim.caller, claim.request.clone())
+                    .await
+                    .unwrap_or_else(|e| error_result(e, &claim.request));
+                let redactor = SecretRedactor::from_config(config);
+                redact_result(&redactor, &mut result);
+                approvals.finish(&claim.id, &result)?;
+                audit_approval(
+                    if result.ok {
+                        "approval_executed"
+                    } else {
+                        "approval_failed"
+                    },
+                    &approvals.show(&claim.id)?,
+                    caller,
+                );
+                Ok(CommandResult::success().with_data(json!({"status":if result.ok{"executed"}else{"failed"},"approval_id":claim.id,"result":result})))
+            }
+            _ => Err(ArrtError::InvalidArgument("not an approval request".into())),
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -286,6 +396,13 @@ impl GatewayService {
                     .await?;
                 Ok(CommandResult::success().with_data(json!({"closed": session_id})))
             }
+            Request::ApprovalList
+            | Request::ApprovalShow { .. }
+            | Request::ApprovalApprove { .. }
+            | Request::ApprovalReject { .. }
+            | Request::ApprovalCleanup => Err(ArrtError::InvalidArgument(
+                "approval request reached operation executor".into(),
+            )),
         }
     }
 }
@@ -419,7 +536,19 @@ fn request_name(request: &Request) -> &'static str {
         Request::SessionList => "session_list",
         Request::SessionInspect { .. } => "session_inspect",
         Request::SessionClose { .. } => "session_close",
+        Request::ApprovalList => "approval_list",
+        Request::ApprovalShow { .. } => "approval_show",
+        Request::ApprovalApprove { .. } => "approval_approve",
+        Request::ApprovalReject { .. } => "approval_reject",
+        Request::ApprovalCleanup => "approval_cleanup",
     }
+}
+
+fn audit_approval(event: &str, metadata: &serde_json::Value, caller: CallerType) {
+    eprintln!(
+        "{}",
+        json!({"event":event,"caller":format!("{caller:?}").to_ascii_lowercase(),"metadata":metadata,"timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|d|d.as_millis())})
+    );
 }
 
 #[cfg(test)]

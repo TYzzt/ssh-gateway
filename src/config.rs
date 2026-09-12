@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub approval: ApprovalConfig,
     #[serde(skip)]
     source_path: PathBuf,
 }
@@ -61,6 +63,73 @@ pub struct AgentPolicyConfig {
     pub deny_commands: Vec<String>,
     #[serde(default = "default_audit_command")]
     pub audit_command: bool,
+    #[serde(default)]
+    pub rules: Vec<PolicyRuleConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PolicyRuleConfig {
+    pub id: String,
+    #[serde(rename = "match")]
+    pub matcher: PolicyMatchConfig,
+    pub effect: PolicyEffectConfig,
+    #[serde(default)]
+    pub risk: Option<RiskLevelConfig>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PolicyMatchConfig {
+    pub operation: String,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyEffectConfig {
+    Allow,
+    Confirm,
+    Deny,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevelConfig {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApprovalConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_approval_ttl")]
+    pub ttl_seconds: u64,
+    #[serde(default)]
+    pub storage: ApprovalStorageConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApprovalStorageConfig {
+    #[serde(rename = "type", default = "default_sqlite_type")]
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Default for ApprovalStorageConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_sqlite_type(),
+            path: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -266,6 +335,12 @@ fn default_true() -> bool {
 fn default_audit_command() -> bool {
     true
 }
+fn default_approval_ttl() -> u64 {
+    300
+}
+fn default_sqlite_type() -> String {
+    "sqlite".to_string()
+}
 
 fn default_mcp_listen() -> String {
     "127.0.0.1:8765".to_string()
@@ -346,6 +421,17 @@ impl Default for AgentPolicyConfig {
             allowed_commands: Vec::new(),
             deny_commands: Vec::new(),
             audit_command: true,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_seconds: default_approval_ttl(),
+            storage: ApprovalStorageConfig::default(),
         }
     }
 }
@@ -398,6 +484,16 @@ impl AppConfig {
         for profile in &self.profiles {
             let mut stack = Vec::new();
             let _ = self.resolve_profile(&profile.name, &mut stack)?;
+        }
+        if self.approval.ttl_seconds == 0 {
+            return Err(ArrtError::Config(
+                "approval.ttl_seconds must be greater than zero".into(),
+            ));
+        }
+        if self.approval.storage.kind != "sqlite" {
+            return Err(ArrtError::Config(
+                "approval.storage.type must be sqlite".into(),
+            ));
         }
         Ok(())
     }
@@ -622,6 +718,42 @@ impl Profile {
                 "profile {} agent_policy.deny_commands is not a security boundary; use exact allowed_commands",
                 self.name
             )));
+        }
+        let mut rule_ids = HashSet::new();
+        for rule in &self.agent_policy.rules {
+            if rule.id.trim().is_empty() {
+                return Err(ArrtError::Config(format!(
+                    "profile {} has an empty policy rule id",
+                    self.name
+                )));
+            }
+            if !rule_ids.insert(&rule.id) {
+                return Err(ArrtError::Config(format!(
+                    "profile {} has duplicate policy rule id {}",
+                    self.name, rule.id
+                )));
+            }
+            if !matches!(
+                rule.matcher.operation.as_str(),
+                "exec" | "read" | "write" | "upload" | "download"
+            ) {
+                return Err(ArrtError::Config(format!(
+                    "profile {} rule {} has unsupported operation {}",
+                    self.name, rule.id, rule.matcher.operation
+                )));
+            }
+            if rule.matcher.operation == "exec" && rule.matcher.commands.is_empty() {
+                return Err(ArrtError::Config(format!(
+                    "profile {} exec rule {} has no commands",
+                    self.name, rule.id
+                )));
+            }
+            if rule.matcher.operation != "exec" && rule.matcher.paths.is_empty() {
+                return Err(ArrtError::Config(format!(
+                    "profile {} path rule {} has no paths",
+                    self.name, rule.id
+                )));
+            }
         }
         Ok(())
     }

@@ -1,5 +1,7 @@
 # ssh-gateway
 
+Agent policy supports ordered `allow`, `confirm`, and `deny` rules. Confirmed operations persist in SQLite and execute once only through the Human CLI; MCP and `--agent` cannot approve. See [Human approval](docs/approval.md).
+
 <p align="center">
   <a href="README.zh-CN.md">简体中文</a>
 </p>

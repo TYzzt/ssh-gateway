@@ -24,6 +24,8 @@ pub enum ArrtError {
     PolicyDenied(String),
     #[error("relative local path: {0}")]
     RelativeLocalPath(String),
+    #[error("approval error: {0}")]
+    Approval(String),
     #[error("io error: {0}")]
     Io(String),
 }
@@ -42,6 +44,7 @@ impl ArrtError {
             Self::InvalidArgument(_) => "invalid_argument",
             Self::PolicyDenied(_) => "policy_denied",
             Self::RelativeLocalPath(_) => "relative_local_path",
+            Self::Approval(_) => "approval_error",
             Self::Io(_) => "io_error",
         }
     }

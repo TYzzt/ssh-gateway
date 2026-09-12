@@ -66,7 +66,11 @@ fn response_timeout(request: &RpcRequest) -> Option<Duration> {
         Request::Ping
         | Request::ProfileList
         | Request::ProfileShow { .. }
-        | Request::ProfileValidate { .. } => Some(IPC_GRACE),
+        | Request::ProfileValidate { .. }
+        | Request::ApprovalList
+        | Request::ApprovalShow { .. }
+        | Request::ApprovalReject { .. }
+        | Request::ApprovalCleanup => Some(IPC_GRACE),
         _ => Some(DEFAULT_RPC_TIMEOUT),
     }
 }

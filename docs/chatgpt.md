@@ -1,5 +1,7 @@
 # ChatGPT MCP
 
+MCP returns `confirmation_required` as structured content. Tell the user to approve its ID with `ssh-gateway approval approve <id>`. MCP intentionally has no approve/reject tool; do not rewrite and retry the operation. See [Human approval](approval.md).
+
 `ssh-gateway` exposes a bearer-authenticated Streamable HTTP MCP endpoint at `/mcp`. It does not use the obsolete ChatGPT Plugin Manifest.
 
 ## NAS deployment

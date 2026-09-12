@@ -1,4 +1,5 @@
 mod agent;
+mod approval;
 mod cli;
 mod config;
 mod daemon;

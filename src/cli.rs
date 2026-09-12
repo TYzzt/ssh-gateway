@@ -35,6 +35,7 @@ pub enum TopLevelCommand {
     Download(DownloadCommand),
     Tunnel(TunnelCommand),
     Session(SessionCommand),
+    Approval(ApprovalCommand),
     Mcp(McpCommand),
     Serve(ServeCommand),
 }
@@ -178,6 +179,21 @@ pub enum SessionSubcommand {
     },
 }
 
+#[derive(Args, Debug)]
+pub struct ApprovalCommand {
+    #[command(subcommand)]
+    pub command: ApprovalSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ApprovalSubcommand {
+    List,
+    Show { id: String },
+    Approve { id: String },
+    Reject { id: String },
+    Cleanup,
+}
+
 pub async fn dispatch(cli: Cli) -> CommandResult {
     match dispatch_inner(cli).await {
         Ok(result) => result,
@@ -297,6 +313,21 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 send_request(Request::SessionClose { session_id }, caller, true).await
             }
         },
+        TopLevelCommand::Approval(command) => {
+            if cli.agent {
+                return Err(ArrtError::PolicyDenied(
+                    "agents cannot use approval commands".into(),
+                ));
+            }
+            let request = match command.command {
+                ApprovalSubcommand::List => Request::ApprovalList,
+                ApprovalSubcommand::Show { id } => Request::ApprovalShow { approval_id: id },
+                ApprovalSubcommand::Approve { id } => Request::ApprovalApprove { approval_id: id },
+                ApprovalSubcommand::Reject { id } => Request::ApprovalReject { approval_id: id },
+                ApprovalSubcommand::Cleanup => Request::ApprovalCleanup,
+            };
+            send_request(request, CallerType::HumanCli, true).await
+        }
         TopLevelCommand::Mcp(command) => match command.command {
             McpSubcommand::Serve { listen } => {
                 crate::mcp::serve(listen).await?;

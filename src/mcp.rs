@@ -323,6 +323,15 @@ async fn call_tool(
     guard_local_transfer(name, &args, local_file_root)?;
     let request = request_from_tool(name, &args)?;
     let result = service.execute(request_id, CallerType::Mcp, request).await;
+    if result
+        .data
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(Value::as_str)
+        == Some("confirmation_required")
+    {
+        return Ok(result.data.unwrap_or_default());
+    }
     if !result.ok {
         return Err(result
             .error
@@ -579,6 +588,17 @@ mod tests {
         headers.insert("mcp-name", "exec".parse().unwrap());
         headers.insert("mcp-param-profile", "test".parse().unwrap());
         assert!(routing_headers_match(&headers, "tools/call", &payload));
+    }
+
+    #[test]
+    fn approval_mutation_tools_are_not_exposed() {
+        let names = tool_definitions()
+            .into_iter()
+            .filter_map(|value| value["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("approve") || name.contains("reject")));
     }
 
     #[tokio::test]
