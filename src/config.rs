@@ -183,6 +183,8 @@ pub struct McpConfig {
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub local_file_root: Option<String>,
+    #[serde(default)]
+    pub task_id_env: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -517,6 +519,7 @@ impl Default for McpConfig {
             auth: McpAuthConfig::default(),
             allowed_origins: Vec::new(),
             local_file_root: None,
+            task_id_env: None,
         }
     }
 }

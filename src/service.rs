@@ -340,7 +340,7 @@ impl GatewayService {
                 Ok(CommandResult::success().with_data(approvals.cleanup()?))
             }
             Request::ApprovalApprove { approval_id,grant_ttl_seconds,grant_task_id,max_uses } => {
-                let grant_request=if grant_ttl_seconds.is_some()||grant_task_id.is_some(){let grants=GrantService::from_config(config)?;let ttl=grant_ttl_seconds.unwrap_or(1200);grants.validate_pending_grant(&approval_id,ttl,grant_task_id.as_deref(),max_uses)?;Some((grants,ttl))}else{None};
+                let grant_request=if grant_ttl_seconds.is_some()||grant_task_id.is_some()||max_uses.is_some(){let grants=GrantService::from_config(config)?;let ttl=grant_ttl_seconds.unwrap_or(1200);grants.validate_pending_grant(&approval_id,ttl,grant_task_id.as_deref(),max_uses)?;Some((grants,ttl))}else{None};
                 let claim = approvals.claim(&approval_id)?;
                 let current_hash = request_hash(&claim.request);
                 if current_hash.as_ref().is_err_and(|_| true)
@@ -887,6 +887,62 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn max_uses_only_approval_creates_grant() {
+        let path = std::env::temp_dir().join(format!(
+            "ssh-gateway-grant-max-uses-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config: AppConfig = serde_yaml::from_str(
+            r#"profiles:
+- name: test
+  target: {host: example, user: root, auth: {type: password, password: secret}}
+  agent_policy:
+    rules:
+    - {id: restart, match: {operation: exec, commands: ["systemctl restart nginx"]}, effect: confirm, risk: medium}
+"#,
+        )
+        .unwrap();
+        config.approval.storage.path = Some(path.display().to_string());
+        let request = Request::Exec {
+            profile: "test".into(),
+            command: "systemctl restart nginx".into(),
+            cwd: None,
+            timeout_seconds: Some(1),
+            env: vec![],
+        };
+        let approvals = ApprovalService::from_config(&config).unwrap();
+        let approval = approvals
+            .create(
+                &request,
+                CallerType::Mcp,
+                Some("restart"),
+                None,
+                Some(crate::config::RiskLevelConfig::Medium),
+                &SecretRedactor::from_config(&config),
+                Some("task"),
+            )
+            .unwrap();
+        let id = approval["id"].as_str().unwrap().to_string();
+        let _ = GatewayService::new()
+            .execute_authorization_admin(
+                &config,
+                CallerType::HumanCli,
+                Request::ApprovalApprove {
+                    approval_id: id,
+                    grant_ttl_seconds: None,
+                    grant_task_id: None,
+                    max_uses: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        let grants = GrantService::from_config(&config).unwrap().list().unwrap();
+        assert_eq!(grants.as_array().unwrap().len(), 1);
+        assert_eq!(grants[0]["max_uses"], 10);
         let _ = std::fs::remove_file(path);
     }
 }

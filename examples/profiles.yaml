@@ -93,6 +93,8 @@ mcp:
   auth:
     type: bearer
     token_env: SSH_GATEWAY_MCP_TOKEN
+  # Optional. Required for MCP propose_plan and task-scoped grants.
+  task_id_env: SSH_GATEWAY_TASK_ID
   # Required only for MCP upload_file/download_file. Keep it narrowly scoped.
   local_file_root: /data
   # Add the public HTTPS origin here when a browser-originating MCP client sends Origin.

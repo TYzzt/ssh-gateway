@@ -24,6 +24,7 @@ struct McpState {
     token: Arc<str>,
     allowed_origins: Arc<Vec<String>>,
     local_file_root: Option<Arc<PathBuf>>,
+    task_id: Option<Arc<str>>,
 }
 
 #[derive(Deserialize)]
@@ -83,11 +84,30 @@ pub async fn serve_with_service(
             })
         })
         .transpose()?;
+    let task_id = config
+        .mcp
+        .task_id_env
+        .as_deref()
+        .map(|name| {
+            std::env::var(name)
+                .map_err(|_| ArrtError::Config(format!("MCP task_id_env {name} is not set")))
+                .and_then(|value| {
+                    if value.trim().is_empty() {
+                        Err(ArrtError::Config(format!(
+                            "MCP task_id_env {name} must not be empty"
+                        )))
+                    } else {
+                        Ok(Arc::<str>::from(value))
+                    }
+                })
+        })
+        .transpose()?;
     let state = McpState {
         service,
         token: token.into(),
         allowed_origins: Arc::new(config.mcp.allowed_origins),
         local_file_root,
+        task_id,
     };
     let app = app(state.clone());
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -295,6 +315,7 @@ async fn tool_response(id: Value, call: ToolCall, state: McpState) -> Response {
     let outcome = call_tool(
         &state.service,
         state.local_file_root.as_deref().map(PathBuf::as_path),
+        state.task_id.as_deref(),
         &request_id,
         &call.name,
         call.arguments,
@@ -309,6 +330,7 @@ async fn tool_response(id: Value, call: ToolCall, state: McpState) -> Response {
 async fn call_tool(
     service: &GatewayService,
     local_file_root: Option<&Path>,
+    task_id: Option<&str>,
     request_id: &str,
     name: &str,
     args: Value,
@@ -320,14 +342,20 @@ async fn call_tool(
             .map(|hosts| json!({"hosts": hosts}))
             .map_err(|err| err.to_string());
     }
+    if args.get("task_id").is_some() {
+        return Err(
+            "task_id is injected by the gateway and is not accepted as a tool argument".to_string(),
+        );
+    }
     guard_local_transfer(name, &args, local_file_root)?;
-    let request = request_from_tool(name, &args)?;
-    let task_id = args
-        .get("task_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let request = request_from_tool(name, &args, task_id)?;
     let result = service
-        .execute(request_id, CallerType::Mcp, task_id, request)
+        .execute(
+            request_id,
+            CallerType::Mcp,
+            task_id.map(str::to_string),
+            request,
+        )
         .await;
     if result
         .data
@@ -395,7 +423,12 @@ fn guard_local_transfer(name: &str, args: &Value, root: Option<&Path>) -> Result
     }
 }
 
-fn request_from_tool(name: &str, args: &Value) -> Result<Request, String> {
+fn request_from_tool(name: &str, args: &Value, task_id: Option<&str>) -> Result<Request, String> {
+    if args.get("task_id").is_some() {
+        return Err(
+            "task_id is injected by the gateway and is not accepted as a tool argument".to_string(),
+        );
+    }
     let string = |key: &str| {
         args.get(key)
             .and_then(Value::as_str)
@@ -465,7 +498,9 @@ fn request_from_tool(name: &str, args: &Value) -> Result<Request, String> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Request::PlanPropose {
                 profile: string("profile")?,
-                task_id: string("task_id")?,
+                task_id: task_id
+                    .ok_or_else(|| "propose_plan requires gateway-injected task_id".to_string())?
+                    .to_string(),
                 actions,
             })
         }
@@ -524,7 +559,6 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Response {
 fn tool_definitions() -> Vec<Value> {
     let profile =
         json!({"type":"string", "description":"Configured profile name", "x-mcp-header":"Profile"});
-    let task_id = json!({"type":"string","description":"Stable non-secret task scope identifier"});
     vec![
         tool(
             "list_hosts",
@@ -534,27 +568,27 @@ fn tool_definitions() -> Vec<Value> {
         tool(
             "exec",
             "Execute a command using a reusable SSH session",
-            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":0,"maximum":3600}},"required":["profile","command"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":0,"maximum":3600}},"required":["profile","command"],"additionalProperties":false}),
         ),
         tool(
             "read_file",
             "Read a bounded page of a remote file",
-            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":262144}},"required":["profile","path"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":262144}},"required":["profile","path"],"additionalProperties":false}),
         ),
         tool(
             "write_file",
             "Overwrite or append UTF-8 content to a remote file",
-            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["profile","path","content"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["profile","path","content"],"additionalProperties":false}),
         ),
         tool(
             "upload_file",
             "Upload a file local to the gateway host",
-            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
         ),
         tool(
             "download_file",
             "Download a remote file onto the gateway host",
-            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
         ),
         tool(
             "list_sessions",
@@ -569,7 +603,7 @@ fn tool_definitions() -> Vec<Value> {
         tool(
             "propose_plan",
             "Store an ordered, non-executing plan for later human approval",
-            json!({"type":"object","properties":{"profile":profile,"task_id":{"type":"string"},"actions":{"type":"array","items":{"type":"object","description":"Canonical Request object with a kind field"},"minItems":1}},"required":["profile","task_id","actions"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"actions":{"type":"array","items":{"type":"object","description":"Canonical Request object with a kind field"},"minItems":1}},"required":["profile","actions"],"additionalProperties":false}),
         ),
     ]
 }
@@ -633,6 +667,37 @@ mod tests {
         assert!(names.iter().any(|name| name == "propose_plan"));
     }
 
+    #[test]
+    fn mcp_tools_do_not_accept_agent_supplied_task_id() {
+        let tools = tool_definitions();
+        for tool in &tools {
+            let properties = &tool["inputSchema"]["properties"];
+            assert!(properties.get("task_id").is_none());
+        }
+        assert!(request_from_tool(
+            "exec",
+            &json!({"profile":"test","command":"whoami","task_id":"agent-picked"}),
+            None,
+        )
+        .is_err());
+        assert!(request_from_tool(
+            "propose_plan",
+            &json!({"profile":"test","actions":[{"kind":"exec","profile":"test","command":"whoami","cwd":null,"timeout_seconds":1,"env":[]}]}),
+            None,
+        )
+        .is_err());
+        let plan = request_from_tool(
+            "propose_plan",
+            &json!({"profile":"test","actions":[{"kind":"exec","profile":"test","command":"whoami","cwd":null,"timeout_seconds":1,"env":[]}]}),
+            Some("gateway-task"),
+        )
+        .unwrap();
+        match plan {
+            Request::PlanPropose { task_id, .. } => assert_eq!(task_id, "gateway-task"),
+            _ => panic!("expected plan proposal"),
+        }
+    }
+
     #[tokio::test]
     async fn mcp_http_rejects_missing_bearer_token() {
         let state = McpState {
@@ -640,6 +705,7 @@ mod tests {
             token: "secret".into(),
             allowed_origins: Arc::new(Vec::new()),
             local_file_root: None,
+            task_id: None,
         };
         let response = app(state)
             .oneshot(

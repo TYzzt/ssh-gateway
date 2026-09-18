@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-gateway"
-version = "0.1.3"
+version = "0.1.4-dev"
 dependencies = [
  "axum",
  "base64",

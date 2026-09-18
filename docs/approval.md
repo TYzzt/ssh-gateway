@@ -73,7 +73,7 @@ approval:
 
 ## Plans
 
-MCP agents may call `propose_plan` with a profile, stable task ID, and ordered canonical Request objects. This only persists a proposal. A human reviews it with `ssh-gateway plan show pln_xxx`, then uses `plan approve` or `plan reject`.
+MCP agents may call `propose_plan` with a profile and ordered canonical Request objects. The stable task ID is injected by the gateway from `mcp.task_id_env`; it is not accepted as an agent-supplied tool argument. This only persists a proposal. A human reviews it with `ssh-gateway plan show pln_xxx`, then uses `plan approve` or `plan reject`.
 
 An approved plan is immutable and hash-bound. Requests using its task ID must match the next exact action; each action is claimed once and successful completion advances the plan. A failure fails the plan. MCP exposes no plan approval tool.
 

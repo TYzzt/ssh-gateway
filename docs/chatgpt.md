@@ -2,7 +2,7 @@
 
 MCP returns `confirmation_required` as structured content. Tell the user to approve its ID with `ssh-gateway approval approve <id>`. MCP intentionally has no approve/reject tool; do not rewrite and retry the operation. See [Human approval](approval.md).
 
-Operations accept a non-secret `task_id` for bounded task grants. `propose_plan` may persist an ordered proposal without executing it; plan and grant approval remain Human CLI-only.
+MCP tool calls do not accept `task_id` from the agent. For bounded task grants and Plans, configure the gateway to inject a stable task ID from an environment variable. `propose_plan` may persist an ordered proposal without executing it; plan and grant approval remain Human CLI-only.
 
 `ssh-gateway` exposes a bearer-authenticated Streamable HTTP MCP endpoint at `/mcp`. It does not use the obsolete ChatGPT Plugin Manifest.
 
@@ -28,18 +28,19 @@ mcp:
   auth:
     type: bearer
     token_env: SSH_GATEWAY_MCP_TOKEN
+  task_id_env: SSH_GATEWAY_TASK_ID
   local_file_root: /data
   allowed_origins:
     - https://gateway.example.com
 ```
 
-`local_file_root` is required for `upload_file` and `download_file`; both local paths must remain below it. `allowed_origins` is checked only when the client sends an `Origin` header. Bearer authentication is mandatory.
+`task_id_env` is optional, but `propose_plan` requires it and task-scoped grants only match when it is set. `local_file_root` is required for `upload_file` and `download_file`; both local paths must remain below it. `allowed_origins` is checked only when the client sends an `Origin` header. Bearer authentication is mandatory.
 
 ## ChatGPT setup
 
 Expose `/mcp` through an authenticated HTTPS route. In ChatGPT workspace settings, enable developer mode, create a custom MCP app, provide the HTTPS MCP URL and Bearer authentication, then scan tools. Current ChatGPT custom MCP availability and write-action confirmation depend on workspace plan and admin policy.
 
-Available tools: `list_hosts`, `exec`, `read_file`, `write_file`, `upload_file`, `download_file`, `list_sessions`, and `close_session`. MCP always applies Agent Policy. `read_file` paginates by byte offset and caps one response at 256 KiB.
+Available tools: `list_hosts`, `exec`, `read_file`, `write_file`, `upload_file`, `download_file`, `list_sessions`, `close_session`, and `propose_plan`. MCP always applies Agent Policy. `read_file` paginates by byte offset and caps one response at 256 KiB.
 
 ## Security model
 
