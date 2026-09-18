@@ -1,0 +1,36 @@
+src/mcp.rs
+  s_747ab442f4fd33::t_09f6a6954581ff 345-349,351,353-358,426-431,681,687,693,699
+  s_747ab442f4fd33::t_ae403e94c0ccd6 27,87-104,110,318,333,501-503,571,576,581,586,591,606,670-680,682-686,688-692,694-698,700,708
+.github/workflows/release.yml
+  s_747ab442f4fd33::t_3f33b89d20e393 4,6-7,12,83-85
+Cargo.lock
+  s_747ab442f4fd33::t_4f65811462652c 2342
+Cargo.toml
+  s_747ab442f4fd33::t_f03fc6ea890255 3
+docs/approval.md
+  s_747ab442f4fd33::t_0d8e3661df08e3 76
+docs/chatgpt.md
+  s_747ab442f4fd33::t_1eddec6e45a907 5,31,37,43
+examples/profiles.yaml
+  s_747ab442f4fd33::t_e4f1528da7cd82 96-97
+src/config.rs
+  s_747ab442f4fd33::t_b38782fbd4817c 186-187,522
+src/service.rs
+  s_747ab442f4fd33::t_b35559c1d2231f 343,892-947
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "17bb5efd36b137dbfa7bacbc84fa0343ad107316",
+  "prompts": {},
+  "sessions": {
+    "s_747ab442f4fd33": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0b389-77eb-7241-a77c-9022beb594ea",
+        "model": "gpt-5.5"
+      },
+      "human_author": "zhaotao1 <zhaotao1@lenovo.com>"
+    }
+  }
+}
