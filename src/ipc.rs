@@ -204,6 +204,7 @@ mod tests {
         RpcRequest {
             request_id: "test".to_string(),
             caller: crate::protocol::CallerType::HumanCli,
+            task_id: None,
             request: Request::Exec {
                 profile: "test".to_string(),
                 command: "true".to_string(),

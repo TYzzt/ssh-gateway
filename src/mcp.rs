@@ -322,7 +322,13 @@ async fn call_tool(
     }
     guard_local_transfer(name, &args, local_file_root)?;
     let request = request_from_tool(name, &args)?;
-    let result = service.execute(request_id, CallerType::Mcp, request).await;
+    let task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let result = service
+        .execute(request_id, CallerType::Mcp, task_id, request)
+        .await;
     if result
         .data
         .as_ref()
@@ -445,6 +451,24 @@ fn request_from_tool(name: &str, args: &Value) -> Result<Request, String> {
         "close_session" => Ok(Request::SessionClose {
             session_id: string("session_id")?,
         }),
+        "propose_plan" => {
+            let actions = args
+                .get("actions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "missing actions array".to_string())?
+                .iter()
+                .cloned()
+                .map(|value| {
+                    serde_json::from_value::<Request>(value)
+                        .map_err(|e| format!("invalid plan action: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Request::PlanPropose {
+                profile: string("profile")?,
+                task_id: string("task_id")?,
+                actions,
+            })
+        }
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -500,6 +524,7 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Response {
 fn tool_definitions() -> Vec<Value> {
     let profile =
         json!({"type":"string", "description":"Configured profile name", "x-mcp-header":"Profile"});
+    let task_id = json!({"type":"string","description":"Stable non-secret task scope identifier"});
     vec![
         tool(
             "list_hosts",
@@ -509,27 +534,27 @@ fn tool_definitions() -> Vec<Value> {
         tool(
             "exec",
             "Execute a command using a reusable SSH session",
-            json!({"type":"object","properties":{"profile":profile,"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":0,"maximum":3600}},"required":["profile","command"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"command":{"type":"string"},"cwd":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":0,"maximum":3600}},"required":["profile","command"],"additionalProperties":false}),
         ),
         tool(
             "read_file",
             "Read a bounded page of a remote file",
-            json!({"type":"object","properties":{"profile":profile,"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":262144}},"required":["profile","path"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":262144}},"required":["profile","path"],"additionalProperties":false}),
         ),
         tool(
             "write_file",
             "Overwrite or append UTF-8 content to a remote file",
-            json!({"type":"object","properties":{"profile":profile,"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["profile","path","content"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["profile","path","content"],"additionalProperties":false}),
         ),
         tool(
             "upload_file",
             "Upload a file local to the gateway host",
-            json!({"type":"object","properties":{"profile":profile,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
         ),
         tool(
             "download_file",
             "Download a remote file onto the gateway host",
-            json!({"type":"object","properties":{"profile":profile,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"profile":profile,"task_id":task_id,"src":{"type":"string"},"dst":{"type":"string"}},"required":["profile","src","dst"],"additionalProperties":false}),
         ),
         tool(
             "list_sessions",
@@ -540,6 +565,11 @@ fn tool_definitions() -> Vec<Value> {
             "close_session",
             "Close a reusable SSH session",
             json!({"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}),
+        ),
+        tool(
+            "propose_plan",
+            "Store an ordered, non-executing plan for later human approval",
+            json!({"type":"object","properties":{"profile":profile,"task_id":{"type":"string"},"actions":{"type":"array","items":{"type":"object","description":"Canonical Request object with a kind field"},"minItems":1}},"required":["profile","task_id","actions"],"additionalProperties":false}),
         ),
     ]
 }
@@ -599,6 +629,8 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| name.contains("approve") || name.contains("reject")));
+        assert!(!names.iter().any(|name| name.starts_with("grant_")));
+        assert!(names.iter().any(|name| name == "propose_plan"));
     }
 
     #[tokio::test]

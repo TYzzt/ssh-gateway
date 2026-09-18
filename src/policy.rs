@@ -125,6 +125,19 @@ impl PolicyEngine {
                     "approval administration requires Human CLI".to_string(),
                 ))
             }
+            Request::GrantList
+            | Request::GrantShow { .. }
+            | Request::GrantRevoke { .. }
+            | Request::GrantCleanup
+            | Request::PlanList
+            | Request::PlanShow { .. }
+            | Request::PlanApprove { .. }
+            | Request::PlanReject { .. } => {
+                return Err(ArrtError::PolicyDenied(
+                    "authorization administration requires Human CLI".into(),
+                ))
+            }
+            Request::PlanPropose { .. } => None,
             Request::SessionClose { .. } | Request::SessionInspect { .. } => None,
             Request::SessionList
             | Request::Ping

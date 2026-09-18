@@ -5,6 +5,11 @@ approval:
   storage:
     type: sqlite
     path: /data/approvals.db
+  grants:
+    max_ttl_seconds: 3600
+    default_max_uses: 20
+    high: { task: true, time: false }
+    critical: { task: false, time: false }
 
 # This file shows both supported transport styles:
 # 1. direct SSH with gateway-managed bastion auth

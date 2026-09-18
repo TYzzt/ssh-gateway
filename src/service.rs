@@ -1,6 +1,7 @@
 use crate::approval::{request_hash, ApprovalService};
 use crate::config::{config_path_display, AppConfig};
 use crate::errors::ArrtError;
+use crate::grant::{GrantService, PlanAuthorization};
 use crate::policy::{PolicyEffect, PolicyEngine};
 use crate::protocol::{CallerType, CommandResult, ErrorPayload, Request};
 use crate::redaction::SecretRedactor;
@@ -112,6 +113,7 @@ impl GatewayService {
         &self,
         request_id: &str,
         caller: CallerType,
+        task_id: Option<String>,
         request: Request,
     ) -> CommandResult {
         let started = Instant::now();
@@ -143,32 +145,27 @@ impl GatewayService {
                         | Request::ApprovalApprove { .. }
                         | Request::ApprovalReject { .. }
                         | Request::ApprovalCleanup
+                        | Request::GrantList
+                        | Request::GrantShow { .. }
+                        | Request::GrantRevoke { .. }
+                        | Request::GrantCleanup
+                        | Request::PlanPropose { .. }
+                        | Request::PlanList
+                        | Request::PlanShow { .. }
+                        | Request::PlanApprove { .. }
+                        | Request::PlanReject { .. }
                 ) {
-                    self.execute_approval(&config, caller, request.clone())
+                    self.execute_authorization_admin(&config, caller, request.clone())
                         .await
                 } else {
-                    match PolicyEngine::authorize(&config, caller, &request) {
-                        Ok(decision) if decision.effect == PolicyEffect::Allow => {
-                            self.execute_authorized(&config, caller, request.clone())
-                                .await
-                        }
-                    Ok(decision) if decision.effect == PolicyEffect::Confirm => {
-                        ApprovalService::from_config(&config).and_then(|service| service.create(
-                            &request, caller, decision.rule_id.as_deref(), decision.reason.as_deref(), decision.risk, &redactor
-                        )).map(|approval| {
-                            let mut audit_metadata=approval.clone();
-                            if let Some(object)=audit_metadata.as_object_mut(){object.insert("rule".into(),json!(decision.rule_id));}
-                            audit_approval("approval_created", &audit_metadata, caller);
-                            CommandResult::success().with_data(json!({"status":"confirmation_required","approval":approval}))
-                        })
-                        }
-                        Ok(decision) => Err(ArrtError::PolicyDenied(
-                            decision
-                                .reason
-                                .unwrap_or_else(|| "policy rule denied operation".into()),
-                        )),
-                        Err(err) => Err(err),
-                    }
+                    self.resolve_operation(
+                        &config,
+                        caller,
+                        task_id.as_deref(),
+                        request.clone(),
+                        &redactor,
+                    )
+                    .await
                 };
                 let mut result = result.unwrap_or_else(|err| error_result(err, &request));
                 redact_result(&redactor, &mut result);
@@ -185,12 +182,144 @@ impl GatewayService {
         result
     }
 
-    async fn execute_approval(
+    async fn resolve_operation(
+        &self,
+        config: &AppConfig,
+        caller: CallerType,
+        task_id: Option<&str>,
+        request: Request,
+        redactor: &SecretRedactor,
+    ) -> Result<CommandResult, ArrtError> {
+        let decision = PolicyEngine::authorize(config, caller, &request)?;
+        if decision.effect == PolicyEffect::Deny {
+            return Err(ArrtError::PolicyDenied(
+                decision
+                    .reason
+                    .unwrap_or_else(|| "policy rule denied operation".into()),
+            ));
+        }
+        if decision.effect == PolicyEffect::Allow
+            && (!caller.enforces_agent_policy() || task_id.is_none() || !config.approval.enabled)
+        {
+            return self.execute_authorized(config, caller, request).await;
+        }
+        let grants = GrantService::from_config(config)?;
+        let profile = request_profile(&request).unwrap_or_default();
+        let plan = if caller.enforces_agent_policy() {
+            grants.claim_plan_action(profile, task_id, &request)?
+        } else {
+            None
+        };
+        if let Some(plan) = plan {
+            return self
+                .execute_enveloped(config, caller, request, Some(plan), None, &grants)
+                .await;
+        }
+        if decision.effect == PolicyEffect::Allow {
+            return self.execute_authorized(config, caller, request).await;
+        }
+        let rule_id = decision
+            .rule_id
+            .as_deref()
+            .ok_or_else(|| ArrtError::PolicyDenied("confirm decision has no rule id".into()))?;
+        if let Some(grant_id) = grants.consume(profile, rule_id, task_id)? {
+            return self
+                .execute_enveloped(config, caller, request, None, Some(grant_id), &grants)
+                .await;
+        }
+        let approval = ApprovalService::from_config(config)?.create(
+            &request,
+            caller,
+            decision.rule_id.as_deref(),
+            decision.reason.as_deref(),
+            decision.risk,
+            redactor,
+            task_id,
+        )?;
+        audit_approval("approval_created", &approval, caller);
+        Ok(CommandResult::success()
+            .with_data(json!({"status":"confirmation_required","approval":approval})))
+    }
+
+    async fn execute_enveloped(
+        &self,
+        config: &AppConfig,
+        caller: CallerType,
+        request: Request,
+        plan: Option<PlanAuthorization>,
+        grant_id: Option<String>,
+        grants: &GrantService,
+    ) -> Result<CommandResult, ArrtError> {
+        let result = self.execute_authorized(config, caller, request).await;
+        if let Some(auth) = plan {
+            let success = result.as_ref().is_ok_and(|r| r.ok);
+            let event = grants.finish_plan_action(&auth, success)?;
+            audit_approval(
+                if event["status"] == "completed" {
+                    "plan_completed"
+                } else {
+                    "plan_action_executed"
+                },
+                &event,
+                caller,
+            );
+        }
+        let mut result = result?;
+        if let Some(id) = grant_id {
+            let data = result.data.get_or_insert_with(|| json!({}));
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "authorization".into(),
+                    json!({"type":"grant","grant_id":id}),
+                );
+            }
+            audit_approval("grant_used", &json!({"grant_id":id}), caller);
+            if grants.show(&id)?["status"] == "exhausted" {
+                audit_approval("grant_exhausted", &json!({"grant_id":id}), caller);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn execute_authorization_admin(
         &self,
         config: &AppConfig,
         caller: CallerType,
         request: Request,
     ) -> Result<CommandResult, ArrtError> {
+        if matches!(request, Request::PlanPropose { .. }) {
+            if caller == CallerType::HumanCli {
+                return Err(ArrtError::PolicyDenied(
+                    "plan proposals require an agent caller".into(),
+                ));
+            }
+            let grants = GrantService::from_config(config)?;
+            let redactor = SecretRedactor::from_config(config);
+            if let Request::PlanPropose {
+                profile,
+                task_id,
+                actions,
+            } = request
+            {
+                for action in &actions {
+                    let decision = PolicyEngine::authorize(config, caller, action)?;
+                    if decision.effect == PolicyEffect::Deny {
+                        return Err(ArrtError::PolicyDenied(
+                            "plan contains a denied action".into(),
+                        ));
+                    }
+                }
+                let plan = grants.propose_plan(
+                    &profile,
+                    &task_id,
+                    &actions,
+                    config.approval.ttl_seconds,
+                    &redactor,
+                )?;
+                audit_approval("plan_created", &plan, caller);
+                return Ok(CommandResult::success().with_data(json!({"plan":plan})));
+            }
+        }
         if caller != CallerType::HumanCli {
             return Err(ArrtError::PolicyDenied(
                 "approval administration requires Human CLI".into(),
@@ -201,8 +330,7 @@ impl GatewayService {
             Request::ApprovalList => {
                 Ok(CommandResult::success().with_data(json!({"approvals":approvals.list()?})))
             }
-            Request::ApprovalShow { approval_id } => Ok(CommandResult::success()
-                .with_data(json!({"approval":approvals.show(&approval_id)?}))),
+            Request::ApprovalShow { approval_id } => {let mut approval=approvals.show(&approval_id)?;add_approval_suggestions(config,&mut approval);Ok(CommandResult::success().with_data(json!({"approval":approval})))},
             Request::ApprovalReject { approval_id } => {
                 let data = approvals.reject(&approval_id)?;
                 audit_approval("approval_rejected", &approvals.show(&approval_id)?, caller);
@@ -211,7 +339,8 @@ impl GatewayService {
             Request::ApprovalCleanup => {
                 Ok(CommandResult::success().with_data(approvals.cleanup()?))
             }
-            Request::ApprovalApprove { approval_id } => {
+            Request::ApprovalApprove { approval_id,grant_ttl_seconds,grant_task_id,max_uses } => {
+                let grant_request=if grant_ttl_seconds.is_some()||grant_task_id.is_some(){let grants=GrantService::from_config(config)?;let ttl=grant_ttl_seconds.unwrap_or(1200);grants.validate_pending_grant(&approval_id,ttl,grant_task_id.as_deref(),max_uses)?;Some((grants,ttl))}else{None};
                 let claim = approvals.claim(&approval_id)?;
                 let current_hash = request_hash(&claim.request);
                 if current_hash.as_ref().is_err_and(|_| true)
@@ -244,6 +373,12 @@ impl GatewayService {
                     approvals.finish(&claim.id, &failed)?;
                     return Ok(failed);
                 }
+                if let Some((grants,ttl))=grant_request {
+                    if decision.effect == PolicyEffect::Confirm {
+                        let grant=decision.rule_id.as_deref().ok_or_else(||ArrtError::Approval("confirm decision has no rule id".into())).and_then(|rule_id|grants.create_from_claimed_approval(&claim.id,ttl,grant_task_id.as_deref(),max_uses,rule_id));
+                        match grant{Ok(grant)=>audit_approval("grant_created",&grant,caller),Err(err)=>{let failed=error_result(err,&claim.request);approvals.finish(&claim.id,&failed)?;return Ok(failed);}}
+                    }
+                }
                 audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
                 let mut result = self
                     .execute_authorized(config, claim.caller, claim.request.clone())
@@ -263,6 +398,14 @@ impl GatewayService {
                 );
                 Ok(CommandResult::success().with_data(json!({"status":if result.ok{"executed"}else{"failed"},"approval_id":claim.id,"result":result})))
             }
+            Request::GrantList=>Ok(CommandResult::success().with_data(json!({"grants":GrantService::from_config(config)?.list()?}))),
+            Request::GrantShow{grant_id}=>Ok(CommandResult::success().with_data(json!({"grant":GrantService::from_config(config)?.show(&grant_id)?}))),
+            Request::GrantRevoke{grant_id}=>{let data=GrantService::from_config(config)?.revoke(&grant_id)?;audit_approval("grant_revoked",&data,caller);Ok(CommandResult::success().with_data(data))},
+            Request::GrantCleanup=>Ok(CommandResult::success().with_data(GrantService::from_config(config)?.cleanup_grants()?)),
+            Request::PlanList=>Ok(CommandResult::success().with_data(json!({"plans":GrantService::from_config(config)?.list_plans()?}))),
+            Request::PlanShow{plan_id}=>Ok(CommandResult::success().with_data(json!({"plan":GrantService::from_config(config)?.show_plan(&plan_id,&SecretRedactor::from_config(config))?}))),
+            Request::PlanApprove{plan_id}=>{let data=GrantService::from_config(config)?.approve_plan(&plan_id)?;audit_approval("plan_approved",&data,caller);Ok(CommandResult::success().with_data(data))},
+            Request::PlanReject{plan_id}=>{let data=GrantService::from_config(config)?.reject_plan(&plan_id)?;audit_approval("plan_rejected",&data,caller);Ok(CommandResult::success().with_data(data))},
             _ => Err(ArrtError::InvalidArgument("not an approval request".into())),
         }
     }
@@ -403,6 +546,17 @@ impl GatewayService {
             | Request::ApprovalCleanup => Err(ArrtError::InvalidArgument(
                 "approval request reached operation executor".into(),
             )),
+            Request::GrantList
+            | Request::GrantShow { .. }
+            | Request::GrantRevoke { .. }
+            | Request::GrantCleanup
+            | Request::PlanPropose { .. }
+            | Request::PlanList
+            | Request::PlanShow { .. }
+            | Request::PlanApprove { .. }
+            | Request::PlanReject { .. } => Err(ArrtError::InvalidArgument(
+                "authorization administration reached operation executor".into(),
+            )),
         }
     }
 }
@@ -541,6 +695,15 @@ fn request_name(request: &Request) -> &'static str {
         Request::ApprovalApprove { .. } => "approval_approve",
         Request::ApprovalReject { .. } => "approval_reject",
         Request::ApprovalCleanup => "approval_cleanup",
+        Request::GrantList => "grant_list",
+        Request::GrantShow { .. } => "grant_show",
+        Request::GrantRevoke { .. } => "grant_revoke",
+        Request::GrantCleanup => "grant_cleanup",
+        Request::PlanPropose { .. } => "plan_propose",
+        Request::PlanList => "plan_list",
+        Request::PlanShow { .. } => "plan_show",
+        Request::PlanApprove { .. } => "plan_approve",
+        Request::PlanReject { .. } => "plan_reject",
     }
 }
 
@@ -549,6 +712,34 @@ fn audit_approval(event: &str, metadata: &serde_json::Value, caller: CallerType)
         "{}",
         json!({"event":event,"caller":format!("{caller:?}").to_ascii_lowercase(),"metadata":metadata,"timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|d|d.as_millis())})
     );
+}
+
+fn add_approval_suggestions(config: &AppConfig, approval: &mut serde_json::Value) {
+    let risk = approval["risk"].as_str().unwrap_or("low");
+    let policy = match risk {
+        "critical" => &config.approval.grants.critical,
+        "high" => &config.approval.grants.high,
+        "medium" => &config.approval.grants.medium,
+        _ => &config.approval.grants.low,
+    };
+    let mut suggested = json!({"once":{"scope":"exact request"}});
+    if let Some(object) = suggested.as_object_mut() {
+        if policy.task && !approval["task_id"].is_null() {
+            object.insert(
+                "task".into(),
+                json!({"rule_id":approval["rule_id"],"task_id":approval["task_id"],"ttl":"20m"}),
+            );
+        }
+        if policy.time {
+            object.insert(
+                "temporary".into(),
+                json!({"rule_id":approval["rule_id"],"ttl":"30m"}),
+            );
+        }
+    }
+    if let Some(object) = approval.as_object_mut() {
+        object.insert("suggested_approvals".into(), suggested);
+    }
 }
 
 #[cfg(test)]
@@ -587,18 +778,115 @@ mod tests {
     async fn shutdown_respects_caller_policy_before_lifecycle_shortcut() {
         let service = GatewayService::new();
         let human = service
-            .execute("human", CallerType::HumanCli, Request::Shutdown)
+            .execute("human", CallerType::HumanCli, None, Request::Shutdown)
             .await;
         let agent = service
-            .execute("agent", CallerType::AgentCli, Request::Shutdown)
+            .execute("agent", CallerType::AgentCli, None, Request::Shutdown)
             .await;
         let mcp = service
-            .execute("mcp", CallerType::Mcp, Request::Shutdown)
+            .execute("mcp", CallerType::Mcp, None, Request::Shutdown)
             .await;
 
         assert!(human.ok);
         assert_eq!(human.data.unwrap()["status"], "stopping");
         assert_eq!(agent.error.unwrap().code, "policy_denied");
         assert_eq!(mcp.error.unwrap().code, "policy_denied");
+    }
+
+    #[tokio::test]
+    async fn deny_is_checked_before_any_grant() {
+        let path =
+            std::env::temp_dir().join(format!("ssh-gateway-deny-{}.db", uuid::Uuid::new_v4()));
+        let mut config: AppConfig = serde_yaml::from_str(
+            r#"profiles:
+- name: test
+  target: {host: example, user: root, auth: {type: password, password: secret}}
+  agent_policy:
+    rules:
+    - {id: deny, match: {operation: exec, commands: [reboot]}, effect: deny, risk: critical}
+"#,
+        )
+        .unwrap();
+        config.approval.storage.path = Some(path.display().to_string());
+        let request = Request::Exec {
+            profile: "test".into(),
+            command: "reboot".into(),
+            cwd: None,
+            timeout_seconds: Some(1),
+            env: vec![],
+        };
+        let result = GatewayService::new()
+            .resolve_operation(
+                &config,
+                CallerType::Mcp,
+                Some("task"),
+                request,
+                &SecretRedactor::from_config(&config),
+            )
+            .await;
+        assert!(matches!(result, Err(ArrtError::PolicyDenied(_))));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn grant_is_not_created_when_policy_changes_to_deny() {
+        let path = std::env::temp_dir().join(format!(
+            "ssh-gateway-grant-deny-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config: AppConfig = serde_yaml::from_str(
+            r#"profiles:
+- name: test
+  target: {host: example, user: root, auth: {type: password, password: secret}}
+  agent_policy:
+    rules:
+    - {id: dangerous, match: {operation: exec, commands: [reboot]}, effect: deny, risk: critical}
+"#,
+        )
+        .unwrap();
+        config.approval.storage.path = Some(path.display().to_string());
+        config.approval.grants.critical.task = true;
+        let request = Request::Exec {
+            profile: "test".into(),
+            command: "reboot".into(),
+            cwd: None,
+            timeout_seconds: Some(1),
+            env: vec![],
+        };
+        let approvals = ApprovalService::from_config(&config).unwrap();
+        let approval = approvals
+            .create(
+                &request,
+                CallerType::Mcp,
+                Some("dangerous"),
+                None,
+                Some(crate::config::RiskLevelConfig::Critical),
+                &SecretRedactor::from_config(&config),
+                Some("task"),
+            )
+            .unwrap();
+        let id = approval["id"].as_str().unwrap().to_string();
+        let result = GatewayService::new()
+            .execute_authorization_admin(
+                &config,
+                CallerType::HumanCli,
+                Request::ApprovalApprove {
+                    approval_id: id,
+                    grant_ttl_seconds: Some(60),
+                    grant_task_id: Some("task".into()),
+                    max_uses: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        assert!(GrantService::from_config(&config)
+            .unwrap()
+            .list()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }

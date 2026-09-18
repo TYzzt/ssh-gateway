@@ -38,6 +38,9 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
 - Never call `ssh-gateway approval approve` or `approval reject`, directly or through `exec` or a shell. They are Human CLI trust-boundary commands.
 - Never rewrite or wrap a command to bypass a confirm or deny rule.
 - After the human approves, inspect the recorded execution result before continuing.
+- Reuse only the stable task ID assigned to the current task. Never change it to obtain another task's grant.
+- A matching task grant permits normal continuation but never permits widening, extending, creating, or approving grants.
+- Agents may propose a concrete ordered Plan. Never approve or mutate a Plan, add actions after approval, or execute actions out of order.
 
 - Prefer `--profile <name>` over raw hostnames in commands.
 - Do not ask for an IP, password, key, passphrase, bastion, or `via_profile` details when a suitable profile exists.

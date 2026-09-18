@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+pub(crate) static DB_SCHEMA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct ApprovalClaim {
@@ -43,6 +44,9 @@ impl ApprovalService {
             path,
             ttl_seconds: config.approval.ttl_seconds,
         };
+        let _guard = DB_SCHEMA_LOCK
+            .lock()
+            .map_err(|_| ArrtError::Approval("database migration lock poisoned".into()))?;
         service.connection()?;
         Ok(service)
     }
@@ -68,9 +72,24 @@ impl ApprovalService {
             CREATE INDEX IF NOT EXISTS approvals_status_idx ON approvals(status, expires_at);",
         )
         .map_err(db_error)?;
+        let has_task_id = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(approvals)")
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(db_error)?;
+            let names = rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+            names.into_iter().any(|name| name == "task_id")
+        };
+        if !has_task_id {
+            conn.execute("ALTER TABLE approvals ADD COLUMN task_id TEXT", [])
+                .map_err(db_error)?;
+        }
         Ok(conn)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         request: &Request,
@@ -79,6 +98,7 @@ impl ApprovalService {
         reason: Option<&str>,
         risk: Option<RiskLevelConfig>,
         redactor: &SecretRedactor,
+        task_id: Option<&str>,
     ) -> Result<Value, ArrtError> {
         let payload =
             serde_json::to_string(request).map_err(|e| ArrtError::Approval(e.to_string()))?;
@@ -91,10 +111,10 @@ impl ApprovalService {
         let operation = request_name(request);
         let summary = redactor.redact(&safe_summary(request));
         let risk = risk.map(risk_name);
-        self.connection()?.execute("INSERT INTO approvals (id,created_at,expires_at,profile,operation,request_payload,request_hash,rule_id,reason,risk,caller,status,summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id, now, expires, profile, operation, payload, request_hash, rule_id, reason, risk, caller_name(caller), "pending", summary]).map_err(db_error)?;
+        self.connection()?.execute("INSERT INTO approvals (id,created_at,expires_at,profile,operation,request_payload,request_hash,rule_id,reason,risk,caller,status,summary,task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id, now, expires, profile, operation, payload, request_hash, rule_id, reason, risk, caller_name(caller), "pending", summary,task_id]).map_err(db_error)?;
         Ok(
-            json!({"id":id,"profile":profile,"operation":operation,"summary":summary,"risk":risk,"expires_at":expires}),
+            json!({"id":id,"profile":profile,"operation":operation,"summary":summary,"risk":risk,"expires_at":expires,"rule_id":rule_id,"task_id":task_id}),
         )
     }
 
@@ -110,7 +130,7 @@ impl ApprovalService {
 
     pub fn show(&self, id: &str) -> Result<Value, ArrtError> {
         self.expire()?;
-        self.connection()?.query_row("SELECT id,profile,operation,risk,status,created_at,expires_at,summary,rule_id,reason,caller FROM approvals WHERE id=?", [id], |r| Ok(json!({"id":r.get::<_,String>(0)?,"profile":r.get::<_,String>(1)?,"operation":r.get::<_,String>(2)?,"risk":r.get::<_,Option<String>>(3)?,"status":r.get::<_,String>(4)?,"created_at":r.get::<_,u64>(5)?,"expires_at":r.get::<_,u64>(6)?,"summary":r.get::<_,String>(7)?,"rule_id":r.get::<_,Option<String>>(8)?,"reason":r.get::<_,Option<String>>(9)?,"caller":r.get::<_,String>(10)?}))).optional().map_err(db_error)?.ok_or_else(|| ArrtError::Approval(format!("approval not found: {id}")))
+        self.connection()?.query_row("SELECT id,profile,operation,risk,status,created_at,expires_at,summary,rule_id,reason,caller,task_id FROM approvals WHERE id=?", [id], |r| Ok(json!({"id":r.get::<_,String>(0)?,"profile":r.get::<_,String>(1)?,"operation":r.get::<_,String>(2)?,"risk":r.get::<_,Option<String>>(3)?,"status":r.get::<_,String>(4)?,"created_at":r.get::<_,u64>(5)?,"expires_at":r.get::<_,u64>(6)?,"summary":r.get::<_,String>(7)?,"rule_id":r.get::<_,Option<String>>(8)?,"reason":r.get::<_,Option<String>>(9)?,"caller":r.get::<_,String>(10)?,"task_id":r.get::<_,Option<String>>(11)?}))).optional().map_err(db_error)?.ok_or_else(|| ArrtError::Approval(format!("approval not found: {id}")))
     }
 
     pub fn claim(&self, id: &str) -> Result<ApprovalClaim, ArrtError> {
@@ -325,6 +345,7 @@ mod tests {
                 kind: "sqlite".into(),
                 path: Some(path.display().to_string()),
             },
+            grants: crate::config::GrantConfig::default(),
         };
         (ApprovalService::from_config(&config).unwrap(), path)
     }
@@ -357,6 +378,7 @@ mod tests {
                 None,
                 Some(RiskLevelConfig::Medium),
                 &SecretRedactor::default(),
+                None,
             )
             .unwrap();
         let id = created["id"].as_str().unwrap();
@@ -383,6 +405,7 @@ mod tests {
                 None,
                 None,
                 &SecretRedactor::default(),
+                None,
             )
             .unwrap()["id"]
             .as_str()
@@ -424,6 +447,7 @@ mod tests {
                 None,
                 None,
                 &SecretRedactor::default(),
+                None,
             )
             .unwrap()["id"]
             .as_str()
@@ -442,6 +466,7 @@ mod tests {
                 None,
                 None,
                 &SecretRedactor::default(),
+                None,
             )
             .unwrap()["id"]
             .as_str()
@@ -476,6 +501,7 @@ mod tests {
                 None,
                 None,
                 &SecretRedactor::default(),
+                None,
             )
             .unwrap()["id"]
             .as_str()

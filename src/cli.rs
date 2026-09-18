@@ -20,6 +20,9 @@ pub struct Cli {
     /// Apply profile agent policy to this invocation.
     #[arg(long, global = true)]
     pub agent: bool,
+    /// Stable task identifier used only to restrict task grants and plans.
+    #[arg(long, global = true)]
+    pub task_id: Option<String>,
     #[command(subcommand)]
     pub command: TopLevelCommand,
 }
@@ -36,6 +39,8 @@ pub enum TopLevelCommand {
     Tunnel(TunnelCommand),
     Session(SessionCommand),
     Approval(ApprovalCommand),
+    Grant(GrantCommand),
+    Plan(PlanCommand),
     Mcp(McpCommand),
     Serve(ServeCommand),
 }
@@ -188,10 +193,47 @@ pub struct ApprovalCommand {
 #[derive(Subcommand, Debug)]
 pub enum ApprovalSubcommand {
     List,
+    Show {
+        id: String,
+    },
+    Approve {
+        id: String,
+        #[arg(long="for",value_parser=parse_duration)]
+        grant_ttl_seconds: Option<u64>,
+        #[arg(long = "task")]
+        task_id: Option<String>,
+        #[arg(long)]
+        max_uses: Option<u64>,
+    },
+    Reject {
+        id: String,
+    },
+    Cleanup,
+}
+
+#[derive(Args, Debug)]
+pub struct GrantCommand {
+    #[command(subcommand)]
+    pub command: GrantSubcommand,
+}
+#[derive(Subcommand, Debug)]
+pub enum GrantSubcommand {
+    List,
+    Show { id: String },
+    Revoke { id: String },
+    Cleanup,
+}
+#[derive(Args, Debug)]
+pub struct PlanCommand {
+    #[command(subcommand)]
+    pub command: PlanSubcommand,
+}
+#[derive(Subcommand, Debug)]
+pub enum PlanSubcommand {
+    List,
     Show { id: String },
     Approve { id: String },
     Reject { id: String },
-    Cleanup,
 }
 
 pub async fn dispatch(cli: Cli) -> CommandResult {
@@ -202,6 +244,7 @@ pub async fn dispatch(cli: Cli) -> CommandResult {
 }
 
 async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
+    let task_id = cli.task_id.clone();
     let caller = if cli.agent {
         CallerType::AgentCli
     } else {
@@ -215,7 +258,7 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 ProfileSubcommand::Show { name } => Request::ProfileShow { name },
                 ProfileSubcommand::Validate { name } => Request::ProfileValidate { name },
             };
-            send_request(request, caller, true).await
+            send_request_with_task(request, caller, true, task_id).await
         }
         TopLevelCommand::Exec(command) => {
             let env = command
@@ -241,16 +284,17 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 timeout_seconds,
                 env,
             };
-            send_request(request, caller, true).await
+            send_request_with_task(request, caller, true, task_id).await
         }
         TopLevelCommand::Read(command) => {
-            send_request(
+            send_request_with_task(
                 Request::Read {
                     profile: command.profile,
                     path: command.path,
                 },
                 caller,
                 true,
+                task_id,
             )
             .await
         }
@@ -261,7 +305,7 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 CliWriteMode::Truncate => WriteMode::Truncate,
                 CliWriteMode::Append => WriteMode::Append,
             };
-            send_request(
+            send_request_with_task(
                 Request::Write {
                     profile: command.profile,
                     path: command.path,
@@ -270,16 +314,17 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 },
                 caller,
                 true,
+                task_id,
             )
             .await
         }
         TopLevelCommand::Upload(command) => {
             let request = upload_request(command)?;
-            send_request(request, caller, true).await
+            send_request_with_task(request, caller, true, task_id).await
         }
         TopLevelCommand::Download(command) => {
             let request = download_request(command)?;
-            send_request(request, caller, true).await
+            send_request_with_task(request, caller, true, task_id).await
         }
         TopLevelCommand::Tunnel(command) => match command.command {
             TunnelSubcommand::Open {
@@ -288,7 +333,7 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                 remote,
             } => {
                 let (remote_host, remote_port) = parse_remote_endpoint(&remote)?;
-                send_request(
+                send_request_with_task(
                     Request::TunnelOpen {
                         profile,
                         local_port: local,
@@ -297,11 +342,18 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
                     },
                     caller,
                     true,
+                    task_id,
                 )
                 .await
             }
             TunnelSubcommand::Close { tunnel_id, profile } => {
-                send_request(Request::TunnelClose { tunnel_id, profile }, caller, true).await
+                send_request_with_task(
+                    Request::TunnelClose { tunnel_id, profile },
+                    caller,
+                    true,
+                    task_id,
+                )
+                .await
             }
         },
         TopLevelCommand::Session(command) => match command.command {
@@ -322,9 +374,47 @@ async fn dispatch_inner(cli: Cli) -> Result<CommandResult, ArrtError> {
             let request = match command.command {
                 ApprovalSubcommand::List => Request::ApprovalList,
                 ApprovalSubcommand::Show { id } => Request::ApprovalShow { approval_id: id },
-                ApprovalSubcommand::Approve { id } => Request::ApprovalApprove { approval_id: id },
+                ApprovalSubcommand::Approve {
+                    id,
+                    grant_ttl_seconds,
+                    task_id,
+                    max_uses,
+                } => Request::ApprovalApprove {
+                    approval_id: id,
+                    grant_ttl_seconds,
+                    grant_task_id: task_id,
+                    max_uses,
+                },
                 ApprovalSubcommand::Reject { id } => Request::ApprovalReject { approval_id: id },
                 ApprovalSubcommand::Cleanup => Request::ApprovalCleanup,
+            };
+            send_request(request, CallerType::HumanCli, true).await
+        }
+        TopLevelCommand::Grant(command) => {
+            if cli.agent {
+                return Err(ArrtError::PolicyDenied(
+                    "agents cannot use grant commands".into(),
+                ));
+            }
+            let request = match command.command {
+                GrantSubcommand::List => Request::GrantList,
+                GrantSubcommand::Show { id } => Request::GrantShow { grant_id: id },
+                GrantSubcommand::Revoke { id } => Request::GrantRevoke { grant_id: id },
+                GrantSubcommand::Cleanup => Request::GrantCleanup,
+            };
+            send_request(request, CallerType::HumanCli, true).await
+        }
+        TopLevelCommand::Plan(command) => {
+            if cli.agent {
+                return Err(ArrtError::PolicyDenied(
+                    "agents cannot approve or reject plans".into(),
+                ));
+            }
+            let request = match command.command {
+                PlanSubcommand::List => Request::PlanList,
+                PlanSubcommand::Show { id } => Request::PlanShow { plan_id: id },
+                PlanSubcommand::Approve { id } => Request::PlanApprove { plan_id: id },
+                PlanSubcommand::Reject { id } => Request::PlanReject { plan_id: id },
             };
             send_request(request, CallerType::HumanCli, true).await
         }
@@ -391,6 +481,33 @@ async fn send_request(
     }
 }
 
+async fn send_request_with_task(
+    request: Request,
+    caller: CallerType,
+    auto_start: bool,
+    task_id: Option<String>,
+) -> Result<CommandResult, ArrtError> {
+    let req = rpc_with_task(request, caller, task_id);
+    match ipc::send(&req).await {
+        Ok(response) => Ok(response.result),
+        Err(_err) if auto_start => {
+            spawn_daemon().await?;
+            wait_for_daemon_ready().await?;
+            Ok(ipc::send(&req).await?.result)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn rpc_with_task(request: Request, caller: CallerType, task_id: Option<String>) -> RpcRequest {
+    RpcRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        caller,
+        task_id,
+        request,
+    }
+}
+
 async fn stop_daemon() -> Result<CommandResult, ArrtError> {
     let request = rpc(Request::Shutdown);
     match ipc::send(&request).await {
@@ -440,8 +557,22 @@ fn rpc_with_caller(request: Request, caller: CallerType) -> RpcRequest {
     RpcRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         caller,
+        task_id: None,
         request,
     }
+}
+
+fn parse_duration(raw: &str) -> Result<u64, String> {
+    let (digits, suffix) = raw.split_at(raw.len().saturating_sub(1));
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| "duration must be 5m, 10m, 30m, or 1h".to_string())?;
+    match suffix {
+        "m" => value.checked_mul(60),
+        "h" => value.checked_mul(3600),
+        _ => None,
+    }
+    .ok_or_else(|| "duration must use m or h".to_string())
 }
 
 fn upload_request(command: UploadCommand) -> Result<Request, ArrtError> {
@@ -659,6 +790,53 @@ mod tests {
         ])
         .unwrap();
         assert!(before.agent && after.agent);
+    }
+
+    #[test]
+    fn parses_task_id_and_duration_syntax() {
+        let cli = Cli::try_parse_from([
+            "ssh-gateway",
+            "--agent",
+            "--task-id",
+            "task-a",
+            "exec",
+            "--profile",
+            "test",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(cli.task_id.as_deref(), Some("task-a"));
+        assert_eq!(parse_duration("30m").unwrap(), 1800);
+        assert_eq!(parse_duration("1h").unwrap(), 3600);
+        assert!(parse_duration("forever").is_err());
+    }
+
+    #[test]
+    fn task_aware_rpc_preserves_task_for_exec_and_tunnel() {
+        let exec = rpc_with_task(
+            Request::Exec {
+                profile: "test".into(),
+                command: "true".into(),
+                cwd: None,
+                timeout_seconds: Some(1),
+                env: vec![],
+            },
+            CallerType::AgentCli,
+            Some("task-exec".into()),
+        );
+        assert_eq!(exec.task_id.as_deref(), Some("task-exec"));
+        let tunnel = rpc_with_task(
+            Request::TunnelOpen {
+                profile: "test".into(),
+                local_port: 0,
+                remote_host: "localhost".into(),
+                remote_port: 80,
+            },
+            CallerType::AgentCli,
+            Some("task-tunnel".into()),
+        );
+        assert_eq!(tunnel.task_id.as_deref(), Some("task-tunnel"));
     }
 
     #[test]

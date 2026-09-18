@@ -152,11 +152,37 @@ pub enum Request {
     },
     ApprovalApprove {
         approval_id: String,
+        grant_ttl_seconds: Option<u64>,
+        grant_task_id: Option<String>,
+        max_uses: Option<u64>,
     },
     ApprovalReject {
         approval_id: String,
     },
     ApprovalCleanup,
+    GrantList,
+    GrantShow {
+        grant_id: String,
+    },
+    GrantRevoke {
+        grant_id: String,
+    },
+    GrantCleanup,
+    PlanPropose {
+        profile: String,
+        task_id: String,
+        actions: Vec<Request>,
+    },
+    PlanList,
+    PlanShow {
+        plan_id: String,
+    },
+    PlanApprove {
+        plan_id: String,
+    },
+    PlanReject {
+        plan_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -164,6 +190,8 @@ pub struct RpcRequest {
     pub request_id: String,
     #[serde(default)]
     pub caller: CallerType,
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub request: Request,
 }
 

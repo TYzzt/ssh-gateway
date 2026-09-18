@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod daemon;
 mod errors;
+mod grant;
 mod ipc;
 mod mcp;
 mod policy;

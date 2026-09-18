@@ -2,6 +2,8 @@
 
 MCP returns `confirmation_required` as structured content. Tell the user to approve its ID with `ssh-gateway approval approve <id>`. MCP intentionally has no approve/reject tool; do not rewrite and retry the operation. See [Human approval](approval.md).
 
+Operations accept a non-secret `task_id` for bounded task grants. `propose_plan` may persist an ordered proposal without executing it; plan and grant approval remain Human CLI-only.
+
 `ssh-gateway` exposes a bearer-authenticated Streamable HTTP MCP endpoint at `/mcp`. It does not use the obsolete ChatGPT Plugin Manifest.
 
 ## NAS deployment

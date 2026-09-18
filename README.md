@@ -2,6 +2,8 @@
 
 Agent policy supports ordered `allow`, `confirm`, and `deny` rules. Confirmed operations persist in SQLite and execute once only through the Human CLI; MCP and `--agent` cannot approve. See [Human approval](docs/approval.md).
 
+Rule-scoped task/time grants and hash-bound ordered Plans reduce repeated confirmations without allowing any authorization envelope to override `deny`.
+
 <p align="center">
   <a href="README.zh-CN.md">简体中文</a>
 </p>

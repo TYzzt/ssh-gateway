@@ -113,6 +113,31 @@ pub struct ApprovalConfig {
     pub ttl_seconds: u64,
     #[serde(default)]
     pub storage: ApprovalStorageConfig,
+    #[serde(default)]
+    pub grants: GrantConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GrantConfig {
+    #[serde(default = "default_grant_max_ttl")]
+    pub max_ttl_seconds: u64,
+    #[serde(default = "default_grant_max_uses")]
+    pub default_max_uses: u64,
+    #[serde(default)]
+    pub low: GrantRiskConfig,
+    #[serde(default)]
+    pub medium: GrantRiskConfig,
+    #[serde(default = "default_high_grants")]
+    pub high: GrantRiskConfig,
+    #[serde(default = "default_critical_grants")]
+    pub critical: GrantRiskConfig,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GrantRiskConfig {
+    #[serde(default = "default_true")]
+    pub task: bool,
+    #[serde(default = "default_true")]
+    pub time: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -338,6 +363,24 @@ fn default_audit_command() -> bool {
 fn default_approval_ttl() -> u64 {
     300
 }
+fn default_grant_max_ttl() -> u64 {
+    3600
+}
+fn default_grant_max_uses() -> u64 {
+    20
+}
+fn default_high_grants() -> GrantRiskConfig {
+    GrantRiskConfig {
+        task: true,
+        time: false,
+    }
+}
+fn default_critical_grants() -> GrantRiskConfig {
+    GrantRiskConfig {
+        task: false,
+        time: false,
+    }
+}
 fn default_sqlite_type() -> String {
     "sqlite".to_string()
 }
@@ -432,6 +475,28 @@ impl Default for ApprovalConfig {
             enabled: true,
             ttl_seconds: default_approval_ttl(),
             storage: ApprovalStorageConfig::default(),
+            grants: GrantConfig::default(),
+        }
+    }
+}
+
+impl Default for GrantRiskConfig {
+    fn default() -> Self {
+        Self {
+            task: true,
+            time: true,
+        }
+    }
+}
+impl Default for GrantConfig {
+    fn default() -> Self {
+        Self {
+            max_ttl_seconds: default_grant_max_ttl(),
+            default_max_uses: default_grant_max_uses(),
+            low: GrantRiskConfig::default(),
+            medium: GrantRiskConfig::default(),
+            high: default_high_grants(),
+            critical: default_critical_grants(),
         }
     }
 }
@@ -493,6 +558,11 @@ impl AppConfig {
         if self.approval.storage.kind != "sqlite" {
             return Err(ArrtError::Config(
                 "approval.storage.type must be sqlite".into(),
+            ));
+        }
+        if self.approval.grants.max_ttl_seconds == 0 || self.approval.grants.default_max_uses == 0 {
+            return Err(ArrtError::Config(
+                "approval grant TTL and max uses must be greater than zero".into(),
             ));
         }
         Ok(())

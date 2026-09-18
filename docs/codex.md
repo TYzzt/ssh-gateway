@@ -2,6 +2,8 @@
 
 When a tool returns `status: confirmation_required`, stop and report its ID, summary, risk, and expiry. Never run `ssh-gateway approval approve`, invoke it through a shell, or rewrite the request to evade policy. A human must approve from a non-agent CLI; then inspect the recorded result before continuing. See [Human approval](approval.md).
 
+Use the stable task ID assigned to the current task. After a human creates a task grant, continue normally; never request wildcard scope, extend grants, switch task IDs, or use another task's grant. Agents may propose an ordered Plan, but must never approve or alter it and must execute approved actions in order.
+
 Codex should use the local `ssh-gateway` Skill and CLI. MCP is not required for this workflow.
 
 ## Install

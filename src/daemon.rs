@@ -38,7 +38,12 @@ impl DaemonState {
     pub async fn handle(self: Arc<Self>, request: RpcRequest) -> RpcResponse {
         let result = self
             .service
-            .execute(&request.request_id, request.caller, request.request)
+            .execute(
+                &request.request_id,
+                request.caller,
+                request.task_id,
+                request.request,
+            )
             .await;
         RpcResponse {
             request_id: request.request_id,
