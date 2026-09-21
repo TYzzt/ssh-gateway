@@ -11,7 +11,7 @@ use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Serialize)]
 pub struct PublicProfileInfo {
@@ -23,6 +23,7 @@ pub struct PublicProfileInfo {
 
 pub struct GatewayService {
     sessions: Mutex<SessionManager>,
+    config_access: RwLock<()>,
     maintenance_started: AtomicBool,
 }
 
@@ -30,6 +31,7 @@ impl GatewayService {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(SessionManager::new()),
+            config_access: RwLock::new(()),
             maintenance_started: AtomicBool::new(false),
         })
     }
@@ -46,6 +48,7 @@ impl GatewayService {
                 let Some(service) = service.upgrade() else {
                     break;
                 };
+                let _config_guard = service.config_access.read().await;
                 if let Ok(config) = AppConfig::load().await {
                     service
                         .sessions
@@ -64,6 +67,7 @@ impl GatewayService {
         caller: CallerType,
     ) -> Result<Vec<PublicProfileInfo>, ArrtError> {
         let started = Instant::now();
+        let _config_guard = self.config_access.read().await;
         let config = AppConfig::load().await?;
         let redactor = SecretRedactor::from_config(&config);
         let hosts = config
@@ -73,10 +77,7 @@ impl GatewayService {
                 let caps = &profile.agent_policy.capabilities;
                 let mut capabilities = Vec::new();
                 for (enabled, name) in [
-                    (
-                        caps.exec && !profile.agent_policy.allowed_commands.is_empty(),
-                        "exec",
-                    ),
+                    (caps.exec, "exec"),
                     (caps.read, "read"),
                     (caps.write, "write"),
                     (caps.upload, "upload"),
@@ -134,11 +135,32 @@ impl GatewayService {
             self.shutdown().await;
             return CommandResult::success().with_data(json!({"status":"stopping"}));
         }
+        let _config_guard = if matches!(
+            &request,
+            Request::ApprovalApprove { .. }
+                | Request::ProfileCreate { .. }
+                | Request::ProfileDelete { .. }
+        ) {
+            None
+        } else {
+            Some(self.config_access.read().await)
+        };
         let config = AppConfig::load().await;
         let mut result = match config {
             Ok(config) => {
-                let redactor = SecretRedactor::from_config(&config);
+                let redactor = match &request {
+                    Request::ProfileCreate { profile } => {
+                        SecretRedactor::from_config_and_profile(&config, profile)
+                    }
+                    _ => SecretRedactor::from_config(&config),
+                };
                 let result = if matches!(
+                    request,
+                    Request::ProfileCreate { .. } | Request::ProfileDelete { .. }
+                ) {
+                    self.execute_mcp_profile_management(&config, caller, request.clone())
+                        .await
+                } else if matches!(
                     request,
                     Request::ApprovalList
                         | Request::ApprovalShow { .. }
@@ -180,6 +202,103 @@ impl GatewayService {
             result.duration_ms = Some(started.elapsed().as_millis());
         }
         result
+    }
+
+    async fn execute_mcp_profile_management(
+        &self,
+        config: &AppConfig,
+        caller: CallerType,
+        request: Request,
+    ) -> Result<CommandResult, ArrtError> {
+        if caller != CallerType::Mcp {
+            return Err(ArrtError::PolicyDenied(
+                "profile management requests are MCP-only".into(),
+            ));
+        }
+        if !config.mcp.profile_management.enabled {
+            return Err(ArrtError::ProfileManagementDisabled);
+        }
+        config.require_mutable_yaml()?;
+        let request = match request {
+            Request::ProfileCreate { profile } => {
+                if config.profiles.iter().any(|item| item.name == profile.name) {
+                    return Err(ArrtError::ProfileAlreadyExists(profile.name));
+                }
+                let mut candidate = config.clone();
+                candidate.profiles.push((*profile).clone());
+                candidate.validate()?;
+                Request::ProfileCreate { profile }
+            }
+            Request::ProfileDelete { profile, .. } => {
+                ensure_profile_deletable(config, &profile)?;
+                if self.sessions.lock().await.has_profile_session(&profile) {
+                    return Err(ArrtError::ProfileInUse(format!(
+                        "profile {profile} has an active session"
+                    )));
+                }
+                Request::ProfileDelete {
+                    expected_profile_hash: config.profile_fingerprint(&profile)?,
+                    profile,
+                }
+            }
+            _ => {
+                return Err(ArrtError::InvalidArgument(
+                    "not a profile management request".into(),
+                ))
+            }
+        };
+        self.execute_profile_mutation(config, request).await
+    }
+
+    async fn execute_profile_mutation(
+        &self,
+        config: &AppConfig,
+        request: Request,
+    ) -> Result<CommandResult, ArrtError> {
+        let _guard = self.config_access.write().await;
+        let mut config = config.reload_if_file_backed().await?;
+        if !config.mcp.profile_management.enabled {
+            return Err(ArrtError::ProfileManagementDisabled);
+        }
+        config.require_mutable_yaml()?;
+        let expected_file_hash = config.file_hash().await?;
+        match request {
+            Request::ProfileCreate { profile } => {
+                if config.profiles.iter().any(|item| item.name == profile.name) {
+                    return Err(ArrtError::ProfileAlreadyExists(profile.name));
+                }
+                let name = profile.name.clone();
+                config.profiles.push(*profile);
+                config.validate()?;
+                config.write_yaml_atomic(&expected_file_hash).await?;
+                Ok(CommandResult::success().with_data(json!({"created":name})))
+            }
+            Request::ProfileDelete {
+                profile,
+                expected_profile_hash,
+            } => {
+                ensure_profile_deletable(&config, &profile)?;
+                if config.profile_fingerprint(&profile)? != expected_profile_hash {
+                    return Err(ArrtError::ConfigConflict(format!(
+                        "profile {profile} changed while the mutation was being prepared"
+                    )));
+                }
+                let sessions = self.sessions.lock().await;
+                if sessions.has_profile_session(&profile) {
+                    return Err(ArrtError::ProfileInUse(format!(
+                        "profile {profile} has an active session"
+                    )));
+                }
+                config.profiles.retain(|item| item.name != profile);
+                config.validate()?;
+                config.write_yaml_atomic(&expected_file_hash).await?;
+                drop(sessions);
+                Ok(CommandResult::success().with_data(json!({"deleted":profile})))
+            }
+            _ => Err(ArrtError::InvalidArgument(
+                "not a profile management request".into(),
+            )),
+        }
     }
 
     async fn resolve_operation(
@@ -340,6 +459,18 @@ impl GatewayService {
                 Ok(CommandResult::success().with_data(approvals.cleanup()?))
             }
             Request::ApprovalApprove { approval_id,grant_ttl_seconds,grant_task_id,max_uses } => {
+                let approval_metadata = approvals.show(&approval_id)?;
+                let is_profile_management = matches!(
+                    approval_metadata.get("operation").and_then(|value| value.as_str()),
+                    Some("profile_create" | "profile_delete")
+                );
+                if is_profile_management
+                    && (grant_ttl_seconds.is_some() || grant_task_id.is_some() || max_uses.is_some())
+                {
+                    return Err(ArrtError::PolicyDenied(
+                        "profile management approvals cannot create grants".into(),
+                    ));
+                }
                 let grant_request=if grant_ttl_seconds.is_some()||grant_task_id.is_some()||max_uses.is_some(){let grants=GrantService::from_config(config)?;let ttl=grant_ttl_seconds.unwrap_or(1200);grants.validate_pending_grant(&approval_id,ttl,grant_task_id.as_deref(),max_uses)?;Some((grants,ttl))}else{None};
                 let claim = approvals.claim(&approval_id)?;
                 let current_hash = request_hash(&claim.request);
@@ -353,7 +484,31 @@ impl GatewayService {
                     approvals.finish(&claim.id, &failed)?;
                     return Ok(failed);
                 }
-                let decision = match PolicyEngine::authorize(config, claim.caller, &claim.request) {
+                if matches!(&claim.request, Request::ProfileCreate { .. } | Request::ProfileDelete { .. }) {
+                    audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
+                    let mut result = self
+                        .execute_profile_mutation(config, claim.request.clone())
+                        .await
+                        .unwrap_or_else(|err| error_result(err, &claim.request));
+                    let current_config = AppConfig::load().await.unwrap_or_else(|_| config.clone());
+                    let redactor = match &claim.request {
+                        Request::ProfileCreate { profile } => {
+                            SecretRedactor::from_config_and_profile(&current_config, profile)
+                        }
+                        _ => SecretRedactor::from_config(&current_config),
+                    };
+                    redact_result(&redactor, &mut result);
+                    approvals.finish(&claim.id, &result)?;
+                    audit_approval(
+                        if result.ok { "approval_executed" } else { "approval_failed" },
+                        &approvals.show(&claim.id)?,
+                        caller,
+                    );
+                    return Ok(CommandResult::success().with_data(json!({"status":if result.ok{"executed"}else{"failed"},"approval_id":claim.id,"result":result})));
+                }
+                let _config_guard = self.config_access.read().await;
+                let current_config = config.reload_if_file_backed().await?;
+                let decision = match PolicyEngine::authorize(&current_config, claim.caller, &claim.request) {
                     Ok(decision) => decision,
                     Err(err) => {
                         let failed = error_result(err, &claim.request);
@@ -381,10 +536,10 @@ impl GatewayService {
                 }
                 audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
                 let mut result = self
-                    .execute_authorized(config, claim.caller, claim.request.clone())
+                    .execute_authorized(&current_config, claim.caller, claim.request.clone())
                     .await
                     .unwrap_or_else(|e| error_result(e, &claim.request));
-                let redactor = SecretRedactor::from_config(config);
+                let redactor = SecretRedactor::from_config(&current_config);
                 redact_result(&redactor, &mut result);
                 approvals.finish(&claim.id, &result)?;
                 audit_approval(
@@ -447,6 +602,23 @@ impl GatewayService {
                     Ok(CommandResult::success()
                         .with_data(json!({"valid": true, "profiles": config.profiles.len()})))
                 }
+            }
+            Request::ProfilePolicy { profile } => {
+                let profiles = match profile {
+                    Some(name) => vec![config.profile(&name)?],
+                    None => config.profiles.clone(),
+                };
+                Ok(CommandResult::success().with_data(json!({
+                    "policies": profiles.into_iter().map(|profile| json!({
+                        "profile": profile.name,
+                        "agent_policy": profile.agent_policy,
+                    })).collect::<Vec<_>>()
+                })))
+            }
+            Request::ProfileCreate { .. } | Request::ProfileDelete { .. } => {
+                Err(ArrtError::PolicyDenied(
+                    "profile management requests must use the MCP management tools".into(),
+                ))
             }
             Request::Exec {
                 profile,
@@ -561,6 +733,28 @@ impl GatewayService {
     }
 }
 
+fn ensure_profile_deletable(config: &AppConfig, profile: &str) -> Result<(), ArrtError> {
+    config.profile(profile)?;
+    if config.profiles.len() == 1 {
+        return Err(ArrtError::ProfileInUse(
+            "the last configured profile cannot be deleted".into(),
+        ));
+    }
+    let dependents = config
+        .profiles
+        .iter()
+        .filter(|item| item.via_profile.as_deref() == Some(profile))
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    if !dependents.is_empty() {
+        return Err(ArrtError::ProfileInUse(format!(
+            "profile {profile} is referenced by {}",
+            dependents.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn allowed_remote_paths(
     config: &AppConfig,
     caller: CallerType,
@@ -668,7 +862,12 @@ fn request_profile(request: &Request) -> Option<&str> {
         | Request::Write { profile, .. }
         | Request::Upload { profile, .. }
         | Request::Download { profile, .. }
-        | Request::TunnelOpen { profile, .. } => Some(profile),
+        | Request::TunnelOpen { profile, .. }
+        | Request::ProfileDelete { profile, .. } => Some(profile),
+        Request::ProfileCreate { profile } => Some(&profile.name),
+        Request::ProfilePolicy {
+            profile: Some(profile),
+        } => Some(profile),
         _ => None,
     }
 }
@@ -680,6 +879,9 @@ fn request_name(request: &Request) -> &'static str {
         Request::ProfileList => "profile_list",
         Request::ProfileShow { .. } => "profile_show",
         Request::ProfileValidate { .. } => "profile_validate",
+        Request::ProfilePolicy { .. } => "profile_policy",
+        Request::ProfileCreate { .. } => "profile_create",
+        Request::ProfileDelete { .. } => "profile_delete",
         Request::Exec { .. } => "exec",
         Request::Read { .. } => "read",
         Request::Write { .. } => "write",
@@ -943,6 +1145,92 @@ mod tests {
         let grants = GrantService::from_config(&config).unwrap().list().unwrap();
         assert_eq!(grants.as_array().unwrap().len(), 1);
         assert_eq!(grants[0]["max_uses"], 10);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delete_rejects_last_and_referenced_profiles() {
+        let last: AppConfig = serde_yaml::from_str(
+            "profiles:\n- name: only\n  target: {host: example, user: root, auth: {type: password, password: secret}}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            ensure_profile_deletable(&last, "only"),
+            Err(ArrtError::ProfileInUse(_))
+        ));
+        let referenced: AppConfig = serde_yaml::from_str(
+            "profiles:\n- name: upstream\n  target: {host: example, user: root, auth: {type: password, password: secret}}\n- name: child\n  via_profile: upstream\n  target: {host: child, user: root}\n",
+        )
+        .unwrap();
+        assert!(ensure_profile_deletable(&referenced, "upstream").is_err());
+        assert!(ensure_profile_deletable(&referenced, "child").is_ok());
+    }
+
+    #[tokio::test]
+    async fn policy_query_returns_policy_without_credentials() {
+        let config: AppConfig = serde_yaml::from_str(
+            "profiles:\n- name: test\n  target: {host: example, user: root, auth: {type: password, password: secret}}\n  agent_policy:\n    allowed_commands: [hostname]\n",
+        )
+        .unwrap();
+        let result = GatewayService::new()
+            .execute_authorized(
+                &config,
+                CallerType::Mcp,
+                Request::ProfilePolicy { profile: None },
+            )
+            .await
+            .unwrap();
+        let encoded = result.data.unwrap().to_string();
+        assert!(encoded.contains("hostname"));
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("example"));
+    }
+
+    #[tokio::test]
+    async fn profile_management_approval_cannot_create_a_grant() {
+        let path = std::env::temp_dir().join(format!(
+            "ssh-gateway-profile-admin-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config: AppConfig = serde_yaml::from_str(
+            "profiles:\n- name: test\n  target: {host: example, user: root, auth: {type: password, password: secret}}\nmcp:\n  profile_management: {enabled: true}\n",
+        )
+        .unwrap();
+        config.approval.storage.path = Some(path.display().to_string());
+        let profile = serde_yaml::from_str(
+            "name: new\ntarget: {host: new.example, user: ops, auth: {type: password, password: hidden}}\nagent_policy: {}\n",
+        )
+        .unwrap();
+        let approvals = ApprovalService::from_config(&config).unwrap();
+        let id = approvals
+            .create(
+                &Request::ProfileCreate {
+                    profile: Box::new(profile),
+                },
+                CallerType::Mcp,
+                Some("profile_admin"),
+                None,
+                Some(crate::config::RiskLevelConfig::Critical),
+                &SecretRedactor::from_config(&config),
+                None,
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let result = GatewayService::new()
+            .execute_authorization_admin(
+                &config,
+                CallerType::HumanCli,
+                Request::ApprovalApprove {
+                    approval_id: id,
+                    grant_ttl_seconds: Some(60),
+                    grant_task_id: None,
+                    max_uses: Some(2),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(ArrtError::PolicyDenied(_))));
         let _ = std::fs::remove_file(path);
     }
 }

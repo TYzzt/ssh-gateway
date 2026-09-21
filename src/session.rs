@@ -77,6 +77,12 @@ impl SessionManager {
             .collect::<Vec<_>>())
     }
 
+    pub fn has_profile_session(&self, profile: &str) -> bool {
+        self.sessions.values().any(|session| {
+            session.profile_name == profile || session.upstream_profile.as_deref() == Some(profile)
+        })
+    }
+
     pub fn session_json(&self, id: &str) -> Result<serde_json::Value, ArrtError> {
         let session = self
             .sessions

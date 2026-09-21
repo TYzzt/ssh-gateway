@@ -72,6 +72,16 @@ impl ApprovalService {
             CREATE INDEX IF NOT EXISTS approvals_status_idx ON approvals(status, expires_at);",
         )
         .map_err(db_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+                if sidecar.exists() {
+                    std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+        }
         let has_task_id = {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(approvals)")
@@ -130,7 +140,14 @@ impl ApprovalService {
 
     pub fn show(&self, id: &str) -> Result<Value, ArrtError> {
         self.expire()?;
-        self.connection()?.query_row("SELECT id,profile,operation,risk,status,created_at,expires_at,summary,rule_id,reason,caller,task_id FROM approvals WHERE id=?", [id], |r| Ok(json!({"id":r.get::<_,String>(0)?,"profile":r.get::<_,String>(1)?,"operation":r.get::<_,String>(2)?,"risk":r.get::<_,Option<String>>(3)?,"status":r.get::<_,String>(4)?,"created_at":r.get::<_,u64>(5)?,"expires_at":r.get::<_,u64>(6)?,"summary":r.get::<_,String>(7)?,"rule_id":r.get::<_,Option<String>>(8)?,"reason":r.get::<_,Option<String>>(9)?,"caller":r.get::<_,String>(10)?,"task_id":r.get::<_,Option<String>>(11)?}))).optional().map_err(db_error)?.ok_or_else(|| ArrtError::Approval(format!("approval not found: {id}")))
+        let row = self.connection()?.query_row("SELECT id,profile,operation,risk,status,created_at,expires_at,summary,rule_id,reason,caller,task_id,request_payload FROM approvals WHERE id=?", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,u64>(5)?,r.get::<_,u64>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<String>>(11)?,r.get::<_,String>(12)?))).optional().map_err(db_error)?.ok_or_else(|| ArrtError::Approval(format!("approval not found: {id}")))?;
+        let mut value = json!({"id":row.0,"profile":row.1,"operation":row.2,"risk":row.3,"status":row.4,"created_at":row.5,"expires_at":row.6,"summary":row.7,"rule_id":row.8,"reason":row.9,"caller":row.10,"task_id":row.11});
+        let request: Request = serde_json::from_str(&row.12)
+            .map_err(|err| ArrtError::Approval(format!("decode stored request: {err}")))?;
+        if let Some(details) = safe_details(&request) {
+            value["details"] = details;
+        }
+        Ok(value)
     }
 
     pub fn claim(&self, id: &str) -> Result<ApprovalClaim, ArrtError> {
@@ -239,7 +256,98 @@ fn safe_summary(request: &Request) -> String {
         Request::Write { path, .. } => format!("write {path}"),
         Request::Upload { dst, .. } => format!("upload to {dst}"),
         Request::Download { src, .. } => format!("download {src}"),
+        Request::ProfileCreate { profile } => {
+            let summary = format!(
+                "create profile {} for {}@{}:{}",
+                profile.name, profile.target.user, profile.target.host, profile.target.port
+            );
+            profile_secret_values(profile)
+                .iter()
+                .fold(summary, |text, secret| text.replace(secret, "[REDACTED]"))
+        }
+        Request::ProfileDelete { profile, .. } => format!("delete profile {profile}"),
         _ => request_name(request).to_string(),
+    }
+}
+
+fn safe_details(request: &Request) -> Option<Value> {
+    match request {
+        Request::ProfileCreate { profile } => {
+            let mut value = serde_json::to_value(profile).ok()?;
+            let secrets = profile_secret_values(profile);
+            redact_profile_credentials(&mut value);
+            redact_value_occurrences(&mut value, &secrets);
+            Some(json!({"action":"create","profile":value}))
+        }
+        Request::ProfileDelete {
+            profile,
+            expected_profile_hash,
+        } => Some(json!({
+            "action":"delete",
+            "profile":profile,
+            "expected_profile_hash":expected_profile_hash,
+        })),
+        _ => None,
+    }
+}
+
+fn profile_secret_values(profile: &crate::config::Profile) -> Vec<String> {
+    fn collect(auth: Option<&crate::config::AuthConfig>, values: &mut Vec<String>) {
+        let Some(auth) = auth else {
+            return;
+        };
+        for value in [&auth.password, &auth.passphrase, &auth.key_path]
+            .into_iter()
+            .flatten()
+        {
+            if !value.is_empty() {
+                values.push(value.clone());
+            }
+        }
+    }
+    let mut values = Vec::new();
+    collect(profile.auth.as_ref(), &mut values);
+    collect(profile.target.auth.as_ref(), &mut values);
+    for endpoint in &profile.bastions {
+        collect(endpoint.auth.as_ref(), &mut values);
+    }
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+fn redact_value_occurrences(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => {
+            *text = secrets.iter().fold(text.clone(), |current, secret| {
+                current.replace(secret, "[REDACTED]")
+            });
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_value_occurrences(item, secrets)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| redact_value_occurrences(item, secrets)),
+        _ => {}
+    }
+}
+
+fn redact_profile_credentials(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "password" || key == "passphrase" || key == "key_path" {
+                    if !child.is_null() {
+                        *child = Value::String("[REDACTED]".into());
+                    }
+                } else {
+                    redact_profile_credentials(child);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_profile_credentials),
+        _ => {}
     }
 }
 
@@ -310,7 +418,9 @@ fn request_profile(r: &Request) -> Option<&str> {
         | Request::Write { profile, .. }
         | Request::Upload { profile, .. }
         | Request::Download { profile, .. }
-        | Request::TunnelOpen { profile, .. } => Some(profile),
+        | Request::TunnelOpen { profile, .. }
+        | Request::ProfileDelete { profile, .. } => Some(profile),
+        Request::ProfileCreate { profile } => Some(&profile.name),
         _ => None,
     }
 }
@@ -322,6 +432,8 @@ fn request_name(r: &Request) -> &'static str {
         Request::Upload { .. } => "upload",
         Request::Download { .. } => "download",
         Request::TunnelOpen { .. } => "tunnel",
+        Request::ProfileCreate { .. } => "profile_create",
+        Request::ProfileDelete { .. } => "profile_delete",
         _ => "other",
     }
 }
@@ -510,6 +622,43 @@ mod tests {
         std::fs::write(&src, b"two").unwrap();
         assert!(svc.claim(&id).is_err());
         let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_creation_details_redact_new_credentials() {
+        let (svc, path) = service(300);
+        let profile = serde_yaml::from_str(
+            r#"name: new
+description: deploy with top-secret
+target:
+  host: new.example
+  user: ops
+  auth: {type: password, password: top-secret}
+agent_policy:
+  rules:
+    - {id: all, match: {operation: exec, commands: ['*']}, effect: allow}
+"#,
+        )
+        .unwrap();
+        let created = svc
+            .create(
+                &Request::ProfileCreate {
+                    profile: Box::new(profile),
+                },
+                CallerType::Mcp,
+                Some("profile_admin"),
+                None,
+                Some(RiskLevelConfig::Critical),
+                &SecretRedactor::default(),
+                None,
+            )
+            .unwrap();
+        let shown = svc.show(created["id"].as_str().unwrap()).unwrap();
+        let encoded = shown.to_string();
+        assert!(encoded.contains("[REDACTED]"));
+        assert!(!encoded.contains("top-secret"));
+        assert!(shown.get("request_payload").is_none());
         let _ = std::fs::remove_file(path);
     }
 }

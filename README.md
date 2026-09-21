@@ -40,6 +40,7 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 - **Secret isolation at the gateway API boundary**: the daemon reads passwords, key paths, and optional key passphrases from config; callers send only `profile` plus operation arguments.
 - **Redacted profile and session output**: `profile show`, `session inspect`, and error payloads never echo raw passwords or passphrases.
 - **Profile-first agent workflow**: agents use named profiles instead of embedding secrets in `ssh` commands.
+- **User-confirmed profile management**: MCP can inspect policy and, when explicitly enabled, create or delete profiles after the MCP client obtains user confirmation.
 - **Embedded SSH transport with session reuse**: direct and bastion profiles use in-process SSH instead of spawning local `ssh.exe` or `scp`.
 - **No local OpenSSH dependency for direct or bastion mode**: Windows and Linux direct transports run through the embedded client stack.
 - **Per-hop auth for bastions and targets**: every hop can use its own password or key configuration.

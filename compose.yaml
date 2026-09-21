@@ -9,7 +9,8 @@ services:
       ARRT_CONFIG_PATH: /config/profiles.yaml
       SSH_GATEWAY_MCP_TOKEN: ${SSH_GATEWAY_MCP_TOKEN:?set SSH_GATEWAY_MCP_TOKEN}
     volumes:
-      - ./config:/config:ro
+      # Profile management needs this directory writable for atomic YAML replacement.
+      - ./config:/config
       - ./keys:/keys:ro
       - ./data:/data
     ports:

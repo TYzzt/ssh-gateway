@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Profile};
 use crate::errors::ArrtError;
 use crate::protocol::{CallerType, Request, WriteMode};
 use crate::service::GatewayService;
@@ -25,6 +25,7 @@ struct McpState {
     allowed_origins: Arc<Vec<String>>,
     local_file_root: Option<Arc<PathBuf>>,
     task_id: Option<Arc<str>>,
+    profile_management_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +109,7 @@ pub async fn serve_with_service(
         allowed_origins: Arc::new(config.mcp.allowed_origins),
         local_file_root,
         task_id,
+        profile_management_enabled: config.mcp.profile_management.enabled,
     };
     let app = app(state.clone());
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -192,7 +194,7 @@ async fn mcp_post(
         "ping" => json!({}),
         "tools/list" => json!({
             "resultType": "complete",
-            "tools": tool_definitions(),
+            "tools": tool_definitions(state.profile_management_enabled),
             "ttlMs": 300000,
             "cacheScope": "private"
         }),
@@ -319,6 +321,7 @@ async fn tool_response(id: Value, call: ToolCall, state: McpState) -> Response {
         &request_id,
         &call.name,
         call.arguments,
+        state.profile_management_enabled,
     )
     .await;
     match outcome {
@@ -334,6 +337,7 @@ async fn call_tool(
     request_id: &str,
     name: &str,
     args: Value,
+    profile_management_enabled: bool,
 ) -> Result<Value, String> {
     if name == "list_hosts" {
         return service
@@ -346,6 +350,9 @@ async fn call_tool(
         return Err(
             "task_id is injected by the gateway and is not accepted as a tool argument".to_string(),
         );
+    }
+    if matches!(name, "create_profile" | "delete_profile") && !profile_management_enabled {
+        return Err("profile management is disabled".to_string());
     }
     guard_local_transfer(name, &args, local_file_root)?;
     let request = request_from_tool(name, &args, task_id)?;
@@ -367,9 +374,10 @@ async fn call_tool(
         return Ok(result.data.unwrap_or_default());
     }
     if !result.ok {
-        return Err(result
-            .error
-            .map_or_else(|| "operation failed".to_string(), |error| error.message));
+        return Err(result.error.map_or_else(
+            || "operation failed".to_string(),
+            |error| format!("{}: {}", error.code, error.message),
+        ));
     }
     if name == "read_file" {
         return paginate_read(result.data.unwrap_or_default(), &args);
@@ -452,6 +460,39 @@ fn request_from_tool(name: &str, args: &Value, task_id: Option<&str>) -> Result<
                 env: Vec::new(),
             })
         }
+        "get_profile_policy" => {
+            reject_keys(args, "arguments", &["profile"])?;
+            Ok(Request::ProfilePolicy {
+                profile: match args.get("profile") {
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| "profile must be a string".to_string())?
+                            .to_string(),
+                    ),
+                    None => None,
+                },
+            })
+        }
+        "create_profile" => {
+            reject_keys(args, "arguments", &["profile"])?;
+            let value = args
+                .get("profile")
+                .ok_or_else(|| "missing object argument: profile".to_string())?;
+            if value.get("agent_policy").is_none() {
+                return Err("profile.agent_policy is required".to_string());
+            }
+            Ok(Request::ProfileCreate {
+                profile: Box::new(parse_profile(value)?),
+            })
+        }
+        "delete_profile" => {
+            reject_keys(args, "arguments", &["profile"])?;
+            Ok(Request::ProfileDelete {
+                profile: string("profile")?,
+                expected_profile_hash: String::new(),
+            })
+        }
         "read_file" => Ok(Request::Read {
             profile: string("profile")?,
             path: string("path")?,
@@ -508,6 +549,127 @@ fn request_from_tool(name: &str, args: &Value, task_id: Option<&str>) -> Result<
     }
 }
 
+fn parse_profile(value: &Value) -> Result<Profile, String> {
+    reject_unknown_profile_fields(value)?;
+    serde_json::from_value(value.clone()).map_err(|err| format!("invalid profile: {err}"))
+}
+
+fn reject_unknown_profile_fields(value: &Value) -> Result<(), String> {
+    reject_keys(
+        value,
+        "profile",
+        &[
+            "name",
+            "description",
+            "via_profile",
+            "target",
+            "bastions",
+            "auth",
+            "remote",
+            "agent",
+            "bootstrap",
+            "timeouts",
+            "keepalive",
+            "agent_policy",
+        ],
+    )?;
+    validate_endpoint(value.get("target"), "profile.target")?;
+    if let Some(items) = value.get("bastions").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            validate_endpoint(Some(item), &format!("profile.bastions[{index}]"))?;
+        }
+    }
+    validate_auth(value.get("auth"), "profile.auth")?;
+    reject_optional_keys(value.get("remote"), "profile.remote", &["shell"])?;
+    reject_optional_keys(
+        value.get("agent"),
+        "profile.agent",
+        &["manage", "remote_path", "version"],
+    )?;
+    reject_optional_keys(
+        value.get("bootstrap"),
+        "profile.bootstrap",
+        &["enabled", "remote_temp_dir"],
+    )?;
+    reject_optional_keys(
+        value.get("timeouts"),
+        "profile.timeouts",
+        &["exec_seconds", "idle_session_seconds"],
+    )?;
+    reject_optional_keys(
+        value.get("keepalive"),
+        "profile.keepalive",
+        &["interval_seconds", "count_max"],
+    )?;
+    if let Some(policy) = value.get("agent_policy") {
+        reject_keys(
+            policy,
+            "profile.agent_policy",
+            &[
+                "capabilities",
+                "allowed_read_paths",
+                "allowed_write_paths",
+                "allowed_commands",
+                "deny_commands",
+                "audit_command",
+                "rules",
+            ],
+        )?;
+        reject_optional_keys(
+            policy.get("capabilities"),
+            "profile.agent_policy.capabilities",
+            &["exec", "read", "write", "upload", "download", "tunnel"],
+        )?;
+        if let Some(rules) = policy.get("rules").and_then(Value::as_array) {
+            for (index, rule) in rules.iter().enumerate() {
+                let path = format!("profile.agent_policy.rules[{index}]");
+                reject_keys(rule, &path, &["id", "match", "effect", "risk", "reason"])?;
+                reject_optional_keys(
+                    rule.get("match"),
+                    &format!("{path}.match"),
+                    &["operation", "commands", "paths"],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_endpoint(value: Option<&Value>, path: &str) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    reject_keys(value, path, &["host", "user", "port", "auth"])?;
+    validate_auth(value.get("auth"), &format!("{path}.auth"))
+}
+
+fn validate_auth(value: Option<&Value>, path: &str) -> Result<(), String> {
+    reject_optional_keys(value, path, &["type", "key_path", "passphrase", "password"])
+}
+
+fn reject_optional_keys(value: Option<&Value>, path: &str, allowed: &[&str]) -> Result<(), String> {
+    match value {
+        Some(value) => reject_keys(value, path, allowed),
+        None => Ok(()),
+    }
+}
+
+fn reject_keys(value: &Value, path: &str, allowed: &[&str]) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{path} must be an object"))?;
+    let unknown = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("unknown fields in {path}: {}", unknown.join(", ")))
+    }
+}
+
 fn paginate_read(data: Value, args: &Value) -> Result<Value, String> {
     let encoded = data
         .get("content_b64")
@@ -556,14 +718,19 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Response {
         .into_response()
 }
 
-fn tool_definitions() -> Vec<Value> {
+fn tool_definitions(profile_management_enabled: bool) -> Vec<Value> {
     let profile =
         json!({"type":"string", "description":"Configured profile name", "x-mcp-header":"Profile"});
-    vec![
+    let mut tools = vec![
         tool(
             "list_hosts",
             "List configured hosts without credentials",
             json!({"type":"object", "additionalProperties":false}),
+        ),
+        read_only_tool(
+            "get_profile_policy",
+            "Get the complete Agent Policy for one or all configured profiles",
+            json!({"type":"object","properties":{"profile":profile},"additionalProperties":false}),
         ),
         tool(
             "exec",
@@ -605,11 +772,69 @@ fn tool_definitions() -> Vec<Value> {
             "Store an ordered, non-executing plan for later human approval",
             json!({"type":"object","properties":{"profile":profile,"actions":{"type":"array","items":{"type":"object","description":"Canonical Request object with a kind field"},"minItems":1}},"required":["profile","actions"],"additionalProperties":false}),
         ),
-    ]
+    ];
+    if profile_management_enabled {
+        tools.push(mutating_tool(
+            "create_profile",
+            "Create a profile and Agent Policy after user confirmation",
+            json!({"type":"object","properties":{"profile":profile_schema()},"required":["profile"],"additionalProperties":false}),
+            false,
+        ));
+        tools.push(mutating_tool(
+            "delete_profile",
+            "Delete a profile after user confirmation",
+            json!({"type":"object","properties":{"profile":profile},"required":["profile"],"additionalProperties":false}),
+            true,
+        ));
+    }
+    tools
+}
+
+fn profile_schema() -> Value {
+    let auth = json!({"type":"object","properties":{"type":{"type":"string","enum":["key","password"]},"key_path":{"type":"string"},"passphrase":{"type":"string"},"password":{"type":"string"}},"additionalProperties":false});
+    let endpoint = json!({"type":"object","properties":{"host":{"type":"string"},"user":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"auth":auth},"required":["host","user"],"additionalProperties":false});
+    let capabilities = json!({"type":"object","properties":{"exec":{"type":"boolean"},"read":{"type":"boolean"},"write":{"type":"boolean"},"upload":{"type":"boolean"},"download":{"type":"boolean"},"tunnel":{"type":"boolean"}},"additionalProperties":false});
+    let rule = json!({"type":"object","properties":{"id":{"type":"string"},"match":{"type":"object","properties":{"operation":{"type":"string","enum":["exec","read","write","upload","download"]},"commands":{"type":"array","items":{"type":"string"}},"paths":{"type":"array","items":{"type":"string"}}},"required":["operation"],"additionalProperties":false},"effect":{"type":"string","enum":["allow","confirm","deny"]},"risk":{"type":"string","enum":["low","medium","high","critical"]},"reason":{"type":"string"}},"required":["id","match","effect"],"additionalProperties":false});
+    json!({
+        "type":"object",
+        "properties":{
+            "name":{"type":"string"},"description":{"type":"string"},"via_profile":{"type":"string"},
+            "target":endpoint,"bastions":{"type":"array","items":endpoint},"auth":auth,
+            "remote":{"type":"object","properties":{"shell":{"type":"string"}},"additionalProperties":false},
+            "agent":{"type":"object","properties":{"manage":{"type":"boolean"},"remote_path":{"type":"string"},"version":{"type":"string"}},"additionalProperties":false},
+            "bootstrap":{"type":"object","properties":{"enabled":{"type":"boolean"},"remote_temp_dir":{"type":"string"}},"additionalProperties":false},
+            "timeouts":{"type":"object","properties":{"exec_seconds":{"type":"integer","minimum":0},"idle_session_seconds":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "keepalive":{"type":"object","properties":{"interval_seconds":{"type":"integer","minimum":0},"count_max":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "agent_policy":{"type":"object","properties":{"capabilities":capabilities,"allowed_read_paths":{"type":"array","items":{"type":"string"}},"allowed_write_paths":{"type":"array","items":{"type":"string"}},"allowed_commands":{"type":"array","items":{"type":"string"}},"deny_commands":{"type":"array","items":{"type":"string"}},"audit_command":{"type":"boolean"},"rules":{"type":"array","items":rule}},"additionalProperties":false}
+        },
+        "required":["name","target","agent_policy"],"additionalProperties":false
+    })
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({"name":name, "description":description, "inputSchema":input_schema})
+}
+
+fn read_only_tool(name: &str, description: &str, input_schema: Value) -> Value {
+    let mut definition = tool(name, description, input_schema);
+    definition["annotations"] = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+    });
+    definition
+}
+
+fn mutating_tool(name: &str, description: &str, input_schema: Value, destructive: bool) -> Value {
+    let mut definition = tool(name, description, input_schema);
+    definition["annotations"] = json!({
+        "readOnlyHint": false,
+        "destructiveHint": destructive,
+        "idempotentHint": false,
+        "openWorldHint": false
+    });
+    definition
 }
 
 #[cfg(test)]
@@ -656,7 +881,7 @@ mod tests {
 
     #[test]
     fn approval_mutation_tools_are_not_exposed() {
-        let names = tool_definitions()
+        let names = tool_definitions(true)
             .into_iter()
             .filter_map(|value| value["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
@@ -668,8 +893,77 @@ mod tests {
     }
 
     #[test]
+    fn profile_management_tools_follow_enablement() {
+        let disabled = tool_definitions(false);
+        assert!(disabled
+            .iter()
+            .any(|tool| tool["name"] == "get_profile_policy"));
+        assert!(!disabled.iter().any(|tool| tool["name"] == "create_profile"));
+        assert!(!disabled.iter().any(|tool| tool["name"] == "delete_profile"));
+        let enabled = tool_definitions(true);
+        assert!(enabled.iter().any(|tool| tool["name"] == "create_profile"));
+        assert!(enabled.iter().any(|tool| tool["name"] == "delete_profile"));
+        let create = enabled
+            .iter()
+            .find(|tool| tool["name"] == "create_profile")
+            .unwrap();
+        let delete = enabled
+            .iter()
+            .find(|tool| tool["name"] == "delete_profile")
+            .unwrap();
+        assert_eq!(create["annotations"]["readOnlyHint"], false);
+        assert_eq!(create["annotations"]["destructiveHint"], false);
+        assert_eq!(delete["annotations"]["readOnlyHint"], false);
+        assert_eq!(delete["annotations"]["destructiveHint"], true);
+    }
+
+    #[test]
+    fn profile_policy_tool_is_declared_read_only() {
+        let tools = tool_definitions(false);
+        let definition = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_profile_policy")
+            .unwrap();
+        assert_eq!(definition["annotations"]["readOnlyHint"], true);
+        assert_eq!(definition["annotations"]["destructiveHint"], false);
+        assert_eq!(definition["annotations"]["idempotentHint"], true);
+        assert_eq!(definition["annotations"]["openWorldHint"], false);
+    }
+
+    #[test]
+    fn create_profile_requires_policy_and_rejects_unknown_fields() {
+        let base = json!({
+            "name":"nas",
+            "target":{"host":"nas.local","user":"ops"},
+            "agent_policy":{"capabilities":{"exec":true},"rules":[]}
+        });
+        assert!(matches!(
+            request_from_tool("create_profile", &json!({"profile":base}), None),
+            Ok(Request::ProfileCreate { .. })
+        ));
+        assert!(request_from_tool(
+            "create_profile",
+            &json!({"profile":{
+                "name":"nas","target":{"host":"nas.local","user":"ops"}
+            }}),
+            None
+        )
+        .is_err());
+        assert!(request_from_tool(
+            "create_profile",
+            &json!({"profile":{
+                "name":"nas","target":{"host":"nas.local","user":"ops","typo":true},
+                "agent_policy":{}
+            }}),
+            None
+        )
+        .unwrap_err()
+        .contains("unknown fields"));
+    }
+
+    #[test]
     fn mcp_tools_do_not_accept_agent_supplied_task_id() {
-        let tools = tool_definitions();
+        let tools = tool_definitions(true);
         for tool in &tools {
             let properties = &tool["inputSchema"]["properties"];
             assert!(properties.get("task_id").is_none());
@@ -706,6 +1000,7 @@ mod tests {
             allowed_origins: Arc::new(Vec::new()),
             local_file_root: None,
             task_id: None,
+            profile_management_enabled: false,
         };
         let response = app(state)
             .oneshot(

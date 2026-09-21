@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, ResolvedAuthConfig, ResolvedTransport};
+use crate::config::{AppConfig, AuthConfig, Profile, ResolvedAuthConfig, ResolvedTransport};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -27,6 +27,20 @@ impl SecretRedactor {
         Self { secrets }
     }
 
+    pub fn from_config_and_profile(config: &AppConfig, profile: &Profile) -> Self {
+        let mut redactor = Self::from_config(config);
+        collect_raw_auth(profile.auth.as_ref(), &mut redactor.secrets);
+        collect_raw_auth(profile.target.auth.as_ref(), &mut redactor.secrets);
+        for endpoint in &profile.bastions {
+            collect_raw_auth(endpoint.auth.as_ref(), &mut redactor.secrets);
+        }
+        redactor
+            .secrets
+            .sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        redactor.secrets.dedup();
+        redactor
+    }
+
     pub fn redact(&self, input: &str) -> String {
         let text = self.secrets.iter().fold(input.to_string(), |text, secret| {
             text.replace(secret, "[REDACTED]")
@@ -41,6 +55,18 @@ impl SecretRedactor {
             Value::Object(map) => map.values_mut().for_each(|item| self.redact_value(item)),
             _ => {}
         }
+    }
+}
+
+fn collect_raw_auth(auth: Option<&AuthConfig>, secrets: &mut Vec<String>) {
+    let Some(auth) = auth else {
+        return;
+    };
+    for value in [&auth.password, &auth.passphrase, &auth.key_path]
+        .into_iter()
+        .flatten()
+    {
+        push_secret(secrets, value.clone());
     }
 }
 
@@ -117,5 +143,22 @@ mod tests {
         assert!(redacted.contains("[REDACTED PRIVATE KEY]"));
         assert!(!redacted.contains("abc123"));
         assert!(redacted.contains("before") && redacted.contains("after"));
+    }
+
+    #[test]
+    fn includes_credentials_from_a_proposed_profile() {
+        let config: AppConfig = serde_yaml::from_str(
+            "profiles:\n- name: current\n  target: {host: current, user: root, auth: {type: password, password: existing}}\n",
+        )
+        .unwrap();
+        let profile: Profile = serde_yaml::from_str(
+            "name: new\ntarget: {host: new, user: ops, auth: {type: key, key_path: /keys/private, passphrase: proposed-secret}}\n",
+        )
+        .unwrap();
+        let redactor = SecretRedactor::from_config_and_profile(&config, &profile);
+        assert_eq!(
+            redactor.redact("proposed-secret /keys/private existing"),
+            "[REDACTED] [REDACTED] [REDACTED]"
+        );
     }
 }

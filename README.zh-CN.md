@@ -36,6 +36,7 @@
 - **在 gateway API 边界做 secret isolation**：daemon 从配置文件读取密码、密钥路径和可选的私钥口令；调用方只传 `profile` 和操作参数。
 - **脱敏的 profile / session 输出**：`profile show`、`session inspect`、错误结果都不会回显原始密码或口令。
 - **面向 agent 的 profile-first 工作流**：agent 用 profile 名称工作，而不是拼带密码的 `ssh` 命令。
+- **用户确认的 profile 管理**：MCP 可查询策略；显式开启后，MCP 客户端取得用户确认即可新增或删除 profile。
 - **嵌入式 SSH + 会话复用**：direct / bastion 模式不依赖本地反复起 `ssh.exe` 或 `scp`。
 - **direct / bastion 模式下本地不依赖 OpenSSH**：Windows 和 Linux 的直连传输都走内置 SSH 客户端栈。
 - **逐跳认证**：target 和每个 bastion 都可以各自配置 password 或 key。

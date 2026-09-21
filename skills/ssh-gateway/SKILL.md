@@ -25,10 +25,12 @@ Use `ssh-gateway` instead of raw `ssh` whenever a configured profile can satisfy
    - On Windows, expect the installer to persist the install directory into the user `PATH` for future shells unless explicitly disabled
 2. Run `ssh-gateway profile list`, select the closest matching profile, then validate it with `ssh-gateway profile validate <name>`.
 3. Add `--agent` to remote operations so the profile's Agent Policy is enforced. Prefer:
+   - MCP `get_profile_policy` to inspect Agent Policy without credentials
    - `exec` for commands
    - `read` and `write` for text or file content
    - `upload` and `download` for file transfer
    - `tunnel open` and `tunnel close` for local forwarding
+   - MCP `create_profile` and `delete_profile` for user-confirmed management when exposed
 4. Use `session list` or `session inspect --id ...` when the user needs reuse or transport details.
 5. Use `daemon status` or `daemon stop` only for daemon lifecycle checks; most operations auto-start the daemon when needed.
 

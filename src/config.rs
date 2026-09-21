@@ -2,8 +2,10 @@ use crate::errors::ArrtError;
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 const APP_QUALIFIER: &str = "opensource";
 const APP_ORG: &str = "opensource";
@@ -19,6 +21,8 @@ pub struct AppConfig {
     pub approval: ApprovalConfig,
     #[serde(skip)]
     source_path: PathBuf,
+    #[serde(skip)]
+    source_hash: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -185,6 +189,14 @@ pub struct McpConfig {
     pub local_file_root: Option<String>,
     #[serde(default)]
     pub task_id_env: Option<String>,
+    #[serde(default)]
+    pub profile_management: ProfileManagementConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProfileManagementConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -520,6 +532,7 @@ impl Default for McpConfig {
             allowed_origins: Vec::new(),
             local_file_root: None,
             task_id_env: None,
+            profile_management: ProfileManagementConfig::default(),
         }
     }
 }
@@ -532,6 +545,7 @@ impl AppConfig {
         })?;
         let mut config = parse_config(&raw, &path)?;
         config.source_path = path;
+        config.source_hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
         config.validate()?;
         Ok(config)
     }
@@ -569,6 +583,113 @@ impl AppConfig {
             ));
         }
         Ok(())
+    }
+
+    pub fn profile_fingerprint(&self, name: &str) -> Result<String, ArrtError> {
+        let profile = self.profile(name)?;
+        let bytes = serde_json::to_vec(&profile)
+            .map_err(|err| ArrtError::Config(format!("serialize profile: {err}")))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    pub fn require_mutable_yaml(&self) -> Result<(), ArrtError> {
+        if std::fs::symlink_metadata(&self.source_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(ArrtError::Config(
+                "profile management does not write through configuration symlinks".into(),
+            ));
+        }
+        let extension = self
+            .source_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if extension == "yaml" || extension == "yml" {
+            Ok(())
+        } else {
+            Err(ArrtError::UnsupportedConfigFormat(
+                self.source_path.display().to_string(),
+            ))
+        }
+    }
+
+    pub async fn write_yaml_atomic(&self, expected_file_hash: &str) -> Result<(), ArrtError> {
+        let path = &self.source_path;
+        self.require_mutable_yaml()?;
+        let current = tokio::fs::read(path).await?;
+        let current_hash = format!("{:x}", Sha256::digest(&current));
+        if current_hash != expected_file_hash {
+            return Err(ArrtError::ConfigConflict(
+                "configuration changed while the update was prepared".into(),
+            ));
+        }
+        let serialized = serde_yaml::to_string(self)
+            .map_err(|err| ArrtError::Config(format!("serialize YAML: {err}")))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("profiles.yaml");
+        let temp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        let permissions = tokio::fs::metadata(path).await?.permissions();
+        let result = async {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&temp_path).await?;
+            file.write_all(serialized.as_bytes()).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            tokio::fs::set_permissions(&temp_path, permissions).await?;
+            let latest = tokio::fs::read(path).await?;
+            if format!("{:x}", Sha256::digest(&latest)) != expected_file_hash {
+                return Err(ArrtError::ConfigConflict(
+                    "configuration changed before the update was committed".into(),
+                ));
+            }
+            tokio::fs::rename(&temp_path, path).await?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok::<(), ArrtError>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+        result
+    }
+
+    pub async fn file_hash(&self) -> Result<String, ArrtError> {
+        if !self.source_hash.is_empty() {
+            return Ok(self.source_hash.clone());
+        }
+        let bytes = tokio::fs::read(&self.source_path).await?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    pub async fn reload_if_file_backed(&self) -> Result<Self, ArrtError> {
+        if self.source_path.as_os_str().is_empty() {
+            Ok(self.clone())
+        } else {
+            let raw = tokio::fs::read_to_string(&self.source_path)
+                .await
+                .map_err(|err| {
+                    ArrtError::Config(format!(
+                        "failed to read {}: {}",
+                        self.source_path.display(),
+                        err
+                    ))
+                })?;
+            let mut config = parse_config(&raw, &self.source_path)?;
+            config.source_path = self.source_path.clone();
+            config.source_hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+            config.validate()?;
+            Ok(config)
+        }
     }
 
     pub fn profile(&self, name: &str) -> Result<Profile, ArrtError> {
@@ -1507,5 +1628,43 @@ profiles:
             .unwrap_err()
             .to_string()
             .contains("use exact allowed_commands"));
+    }
+
+    #[test]
+    fn profile_management_does_not_require_server_approvals() {
+        let raw = r#"
+profiles:
+  - name: test
+    target: {host: example, user: root, auth: {type: password, password: secret}}
+approval: {enabled: false}
+mcp:
+  profile_management: {enabled: true}
+"#;
+        let mut config = parse_config(raw, Path::new("profiles.yaml")).unwrap();
+        set_base_dir(&mut config);
+        config.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn atomic_yaml_write_detects_conflicts() {
+        let path =
+            std::env::temp_dir().join(format!("ssh-gateway-config-{}.yaml", uuid::Uuid::new_v4()));
+        let raw = "profiles:\n  - name: test\n    target: {host: example, user: root, auth: {type: password, password: secret}}\n";
+        tokio::fs::write(&path, raw).await.unwrap();
+        let mut config = parse_config(raw, &path).unwrap();
+        config.source_path = path.clone();
+        config.validate().unwrap();
+        let hash = config.file_hash().await.unwrap();
+        config.profiles[0].description = Some("updated".into());
+        config.write_yaml_atomic(&hash).await.unwrap();
+        assert!(tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .contains("updated"));
+        assert!(matches!(
+            config.write_yaml_atomic(&hash).await,
+            Err(ArrtError::ConfigConflict(_))
+        ));
+        let _ = tokio::fs::remove_file(path).await;
     }
 }

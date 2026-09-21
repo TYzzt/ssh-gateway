@@ -6,6 +6,16 @@ pub enum ArrtError {
     Config(String),
     #[error("profile not found: {0}")]
     ProfileNotFound(String),
+    #[error("profile already exists: {0}")]
+    ProfileAlreadyExists(String),
+    #[error("profile is in use: {0}")]
+    ProfileInUse(String),
+    #[error("profile management is disabled")]
+    ProfileManagementDisabled,
+    #[error("unsupported configuration format: {0}")]
+    UnsupportedConfigFormat(String),
+    #[error("configuration conflict: {0}")]
+    ConfigConflict(String),
     #[error("daemon unavailable: {0}")]
     DaemonUnavailable(String),
     #[error("ipc error: {0}")]
@@ -35,6 +45,11 @@ impl ArrtError {
         match self {
             Self::Config(_) => "config_error",
             Self::ProfileNotFound(_) => "profile_not_found",
+            Self::ProfileAlreadyExists(_) => "profile_already_exists",
+            Self::ProfileInUse(_) => "profile_in_use",
+            Self::ProfileManagementDisabled => "profile_management_disabled",
+            Self::UnsupportedConfigFormat(_) => "unsupported_config_format",
+            Self::ConfigConflict(_) => "config_conflict",
             Self::DaemonUnavailable(_) => "daemon_unavailable",
             Self::Ipc(_) => "ipc_error",
             Self::RequestTimeout(_) => "request_timeout",

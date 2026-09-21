@@ -67,6 +67,9 @@ fn response_timeout(request: &RpcRequest) -> Option<Duration> {
         | Request::ProfileList
         | Request::ProfileShow { .. }
         | Request::ProfileValidate { .. }
+        | Request::ProfilePolicy { .. }
+        | Request::ProfileCreate { .. }
+        | Request::ProfileDelete { .. }
         | Request::ApprovalList
         | Request::ApprovalShow { .. }
         | Request::ApprovalReject { .. }

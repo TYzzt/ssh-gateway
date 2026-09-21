@@ -143,7 +143,13 @@ impl PolicyEngine {
             | Request::Ping
             | Request::ProfileList
             | Request::ProfileShow { .. }
-            | Request::ProfileValidate { .. } => None,
+            | Request::ProfileValidate { .. }
+            | Request::ProfilePolicy { .. } => None,
+            Request::ProfileCreate { .. } | Request::ProfileDelete { .. } => {
+                return Err(ArrtError::PolicyDenied(
+                    "profile management cannot be granted or included in a plan".into(),
+                ))
+            }
             Request::Shutdown => None,
         };
         let Some(policy) = policy else {

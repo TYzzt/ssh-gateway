@@ -1,3 +1,4 @@
+use crate::config::Profile;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -100,6 +101,17 @@ pub enum Request {
     },
     ProfileValidate {
         name: Option<String>,
+    },
+    ProfilePolicy {
+        profile: Option<String>,
+    },
+    ProfileCreate {
+        profile: Box<Profile>,
+    },
+    ProfileDelete {
+        profile: String,
+        #[serde(default)]
+        expected_profile_hash: String,
     },
     Exec {
         profile: String,
