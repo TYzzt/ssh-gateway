@@ -41,6 +41,13 @@ impl client::Handler for GatewayClient {
 }
 
 impl EmbeddedSession {
+    #[cfg(test)]
+    pub fn test_empty() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
     pub async fn connect(profile: &ResolvedProfile) -> Result<Self, ArrtError> {
         let config = Arc::new(client::Config {
             nodelay: true,

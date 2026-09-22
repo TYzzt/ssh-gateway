@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 #[derive(Clone)]
 pub struct SessionInfo {
     pub session_id: String,
+    pub namespace: String,
     pub profile_name: String,
     pub transport: Arc<EmbeddedSession>,
     pub delegated_target: Option<DelegatedEndpoint>,
@@ -60,7 +61,7 @@ pub struct TunnelInfo {
 #[derive(Default)]
 pub struct SessionManager {
     sessions: HashMap<String, SessionInfo>,
-    profile_index: HashMap<String, String>,
+    profile_index: HashMap<(String, String), String>,
     tunnels: HashMap<String, TunnelInfo>,
 }
 
@@ -69,24 +70,28 @@ impl SessionManager {
         Self::default()
     }
 
-    pub fn sessions_json(&self) -> serde_json::Value {
+    pub fn sessions_json(&self, namespace: &str) -> serde_json::Value {
         json!(self
             .sessions
             .values()
+            .filter(|session| session.namespace == namespace)
             .map(|session| self.session_summary(session))
             .collect::<Vec<_>>())
     }
 
-    pub fn has_profile_session(&self, profile: &str) -> bool {
+    pub fn has_profile_session(&self, namespace: &str, profile: &str) -> bool {
         self.sessions.values().any(|session| {
-            session.profile_name == profile || session.upstream_profile.as_deref() == Some(profile)
+            session.namespace == namespace
+                && (session.profile_name == profile
+                    || session.upstream_profile.as_deref() == Some(profile))
         })
     }
 
-    pub fn session_json(&self, id: &str) -> Result<serde_json::Value, ArrtError> {
+    pub fn session_json(&self, namespace: &str, id: &str) -> Result<serde_json::Value, ArrtError> {
         let session = self
             .sessions
             .get(id)
+            .filter(|session| session.namespace == namespace)
             .ok_or_else(|| ArrtError::SessionNotFound(id.to_string()))?;
         Ok(self.session_summary(session))
     }
@@ -94,13 +99,19 @@ impl SessionManager {
     pub async fn close_session(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         session_id: &str,
     ) -> Result<(), ArrtError> {
+        self.sessions
+            .get(session_id)
+            .filter(|session| session.namespace == namespace)
+            .ok_or_else(|| ArrtError::SessionNotFound(session_id.to_string()))?;
         let session = self
             .sessions
             .remove(session_id)
             .ok_or_else(|| ArrtError::SessionNotFound(session_id.to_string()))?;
-        self.profile_index.remove(&session.profile_name);
+        self.profile_index
+            .remove(&(session.namespace.clone(), session.profile_name.clone()));
 
         let tunnel_ids = self
             .tunnels
@@ -114,7 +125,7 @@ impl SessionManager {
             })
             .collect::<Vec<_>>();
         for tunnel_id in tunnel_ids {
-            let _ = self.tunnel_close(config, &tunnel_id).await;
+            let _ = self.tunnel_close(config, namespace, &tunnel_id).await;
         }
 
         if session.owns_transport {
@@ -126,13 +137,23 @@ impl SessionManager {
     pub async fn close_all(&mut self, config: &AppConfig) {
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         for id in ids {
-            let _ = self.close_session(config, &id).await;
+            let Some(namespace) = self
+                .sessions
+                .get(&id)
+                .map(|session| session.namespace.clone())
+            else {
+                continue;
+            };
+            let _ = self.close_session(config, &namespace, &id).await;
         }
     }
 
-    pub async fn reap_idle_sessions(&mut self, config: &AppConfig) {
+    pub async fn reap_idle_sessions(&mut self, config: &AppConfig, namespace: &str) {
         let mut expired = Vec::new();
         for (session_id, session) in &self.sessions {
+            if session.namespace != namespace {
+                continue;
+            }
             let has_tunnel = self
                 .tunnels
                 .values()
@@ -149,17 +170,19 @@ impl SessionManager {
             }
         }
         for session_id in expired {
-            let _ = self.close_session(config, &session_id).await;
+            let _ = self.close_session(config, namespace, &session_id).await;
         }
     }
 
     fn ensure_session<'a>(
         &'a mut self,
         config: &'a AppConfig,
+        namespace: &'a str,
         profile: &'a ResolvedProfile,
     ) -> Pin<Box<dyn Future<Output = Result<String, ArrtError>> + Send + 'a>> {
         Box::pin(async move {
-            if let Some(session_id) = self.profile_index.get(&profile.name).cloned() {
+            let profile_key = (namespace.to_string(), profile.name.clone());
+            if let Some(session_id) = self.profile_index.get(&profile_key).cloned() {
                 if let Some(existing) = self.sessions.get_mut(&session_id) {
                     if existing.transport.is_alive().await {
                         existing.last_used = Instant::now();
@@ -167,7 +190,7 @@ impl SessionManager {
                     }
                 }
                 self.sessions.remove(&session_id);
-                self.profile_index.remove(&profile.name);
+                self.profile_index.remove(&profile_key);
             }
 
             let session_id = uuid::Uuid::new_v4().to_string();
@@ -184,7 +207,8 @@ impl SessionManager {
                         target,
                     } => {
                         let upstream = config.resolved_profile(via_profile)?;
-                        let upstream_session_id = self.ensure_session(config, &upstream).await?;
+                        let upstream_session_id =
+                            self.ensure_session(config, namespace, &upstream).await?;
                         let upstream_transport = self
                             .sessions
                             .get(&upstream_session_id)
@@ -201,6 +225,7 @@ impl SessionManager {
                 };
             let session = SessionInfo {
                 session_id: session_id.clone(),
+                namespace: namespace.to_string(),
                 profile_name: profile.name.clone(),
                 transport,
                 delegated_target,
@@ -211,8 +236,7 @@ impl SessionManager {
                 last_used: Instant::now(),
                 active_operations: 0,
             };
-            self.profile_index
-                .insert(profile.name.clone(), session_id.clone());
+            self.profile_index.insert(profile_key, session_id.clone());
             self.sessions.insert(session_id.clone(), session);
             Ok(session_id)
         })
@@ -373,6 +397,7 @@ impl SessionManager {
     pub async fn prepare_exec(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         profile_name: &str,
         command: String,
         cwd: Option<String>,
@@ -380,7 +405,7 @@ impl SessionManager {
         env: Vec<EnvVar>,
     ) -> Result<PreparedExec, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
-        let session_id = self.ensure_session(config, &profile).await?;
+        let session_id = self.ensure_session(config, namespace, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
         let timeout_seconds = timeout_seconds.unwrap_or(profile.timeouts.exec_seconds);
         let mut args = vec![
@@ -456,12 +481,13 @@ impl SessionManager {
     pub async fn read(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         profile_name: &str,
         path: String,
         allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
-        let session_id = self.ensure_session(config, &profile).await?;
+        let session_id = self.ensure_session(config, namespace, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
         let mut args = vec![
             if allowed_roots.is_empty() {
@@ -490,6 +516,7 @@ impl SessionManager {
     pub async fn write(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         profile_name: &str,
         path: String,
         mode: WriteMode,
@@ -497,7 +524,7 @@ impl SessionManager {
         allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
-        let session_id = self.ensure_session(config, &profile).await?;
+        let session_id = self.ensure_session(config, namespace, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
         let content = BASE64
             .decode(content_b64.as_bytes())
@@ -521,6 +548,7 @@ impl SessionManager {
     pub async fn upload(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         profile_name: &str,
         src: String,
         dst: String,
@@ -531,6 +559,7 @@ impl SessionManager {
         let mut result = self
             .write(
                 config,
+                namespace,
                 profile_name,
                 dst.clone(),
                 WriteMode::Truncate,
@@ -551,6 +580,7 @@ impl SessionManager {
     pub async fn download(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         profile_name: &str,
         src: String,
         dst: String,
@@ -558,7 +588,7 @@ impl SessionManager {
     ) -> Result<CommandResult, ArrtError> {
         let dst = absolute_local_path(dst, "download dst")?;
         let mut result = self
-            .read(config, profile_name, src.clone(), allowed_roots)
+            .read(config, namespace, profile_name, src.clone(), allowed_roots)
             .await?;
         if !result.ok {
             add_transfer_paths(
@@ -593,13 +623,14 @@ impl SessionManager {
     pub async fn tunnel_open(
         &mut self,
         config: &AppConfig,
+        namespace: &str,
         profile_name: &str,
         local_port: u16,
         remote_host: String,
         remote_port: u16,
     ) -> Result<CommandResult, ArrtError> {
         let profile = config.resolved_profile(profile_name)?;
-        let session_id = self.ensure_session(config, &profile).await?;
+        let session_id = self.ensure_session(config, namespace, &profile).await?;
         let session = self
             .sessions
             .get(&session_id)
@@ -668,8 +699,20 @@ impl SessionManager {
     pub async fn tunnel_close(
         &mut self,
         _config: &AppConfig,
+        namespace: &str,
         tunnel_id: &str,
     ) -> Result<CommandResult, ArrtError> {
+        let visible = self
+            .tunnels
+            .get(tunnel_id)
+            .and_then(|tunnel| self.sessions.get(&tunnel.session_id))
+            .is_some_and(|session| session.namespace == namespace);
+        if !visible {
+            return Err(ArrtError::InvalidArgument(format!(
+                "unknown tunnel id: {}",
+                tunnel_id
+            )));
+        }
         let mut tunnel = self.tunnels.remove(tunnel_id).ok_or_else(|| {
             ArrtError::InvalidArgument(format!("unknown tunnel id: {}", tunnel_id))
         })?;
@@ -693,10 +736,11 @@ impl SessionManager {
         Ok(result)
     }
 
-    pub fn tunnel_profile(&self, tunnel_id: &str) -> Option<&str> {
+    pub fn tunnel_profile(&self, namespace: &str, tunnel_id: &str) -> Option<&str> {
         let tunnel = self.tunnels.get(tunnel_id)?;
         self.sessions
             .get(&tunnel.session_id)
+            .filter(|session| session.namespace == namespace)
             .map(|session| session.profile_name.as_str())
     }
 
@@ -832,6 +876,75 @@ fn classify_remote_cwd_error(result: &mut CommandResult, cwd: Option<&str>) {
 #[allow(clippy::items_after_test_module)]
 mod local_path_tests {
     use super::*;
+
+    fn fake_session(namespace: &str, profile_name: &str) -> SessionInfo {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        SessionInfo {
+            session_id,
+            namespace: namespace.to_string(),
+            profile_name: profile_name.to_string(),
+            transport: Arc::new(EmbeddedSession::test_empty()),
+            delegated_target: None,
+            upstream_profile: None,
+            owns_transport: false,
+            agent_path: None,
+            agent_version: None,
+            last_used: Instant::now(),
+            active_operations: 0,
+        }
+    }
+
+    #[test]
+    fn session_views_are_namespaced() {
+        let mut manager = SessionManager::new();
+        let session_a = fake_session("tenant-a", "shared");
+        let session_b = fake_session("tenant-b", "shared");
+        let id_a = session_a.session_id.clone();
+        let id_b = session_b.session_id.clone();
+        manager
+            .profile_index
+            .insert(("tenant-a".into(), "shared".into()), id_a.clone());
+        manager
+            .profile_index
+            .insert(("tenant-b".into(), "shared".into()), id_b.clone());
+        manager.sessions.insert(id_a.clone(), session_a);
+        manager.sessions.insert(id_b.clone(), session_b);
+
+        assert!(manager.has_profile_session("tenant-a", "shared"));
+        assert!(manager.session_json("tenant-a", &id_a).is_ok());
+        assert!(manager.session_json("tenant-a", &id_b).is_err());
+        assert_eq!(
+            manager
+                .sessions_json("tenant-a")
+                .as_array()
+                .expect("session list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn close_session_cannot_cross_namespace() {
+        let config = AppConfig::default();
+        let mut manager = SessionManager::new();
+        let session = fake_session("tenant-a", "shared");
+        let id = session.session_id.clone();
+        manager
+            .profile_index
+            .insert(("tenant-a".into(), "shared".into()), id.clone());
+        manager.sessions.insert(id.clone(), session);
+
+        assert!(manager
+            .close_session(&config, "tenant-b", &id)
+            .await
+            .is_err());
+        assert!(manager.sessions.contains_key(&id));
+        manager
+            .close_session(&config, "tenant-a", &id)
+            .await
+            .unwrap();
+        assert!(!manager.sessions.contains_key(&id));
+    }
 
     #[test]
     fn daemon_rejects_relative_local_paths() {

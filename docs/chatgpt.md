@@ -4,7 +4,7 @@ MCP returns `confirmation_required` as structured content. Tell the user to appr
 
 MCP tool calls do not accept `task_id` from the agent. For bounded task grants and Plans, configure the gateway to inject a stable task ID from an environment variable. `propose_plan` may persist an ordered proposal without executing it; plan and grant approval remain Human CLI-only.
 
-`ssh-gateway` exposes a bearer-authenticated Streamable HTTP MCP endpoint at `/mcp`. It does not use the obsolete ChatGPT Plugin Manifest.
+`ssh-gateway` exposes a Streamable HTTP MCP endpoint at `/mcp`. It supports legacy static Bearer authentication and OAuth JWT resource-server authentication for ChatGPT/Codex custom MCP clients. It does not use the obsolete ChatGPT Plugin Manifest.
 
 ## NAS deployment
 
@@ -44,11 +44,32 @@ mcp:
     enabled: false
 ```
 
-`task_id_env` is optional, but `propose_plan` requires it and task-scoped grants only match when it is set. `local_file_root` is required for `upload_file` and `download_file`; both local paths must remain below it. `allowed_origins` is checked only when the client sends an `Origin` header. Bearer authentication is mandatory.
+`task_id_env` is optional, but `propose_plan` requires it and task-scoped grants only match when it is set. `local_file_root` is required for `upload_file` and `download_file`; both local paths must remain below it. `allowed_origins` is checked only when the client sends an `Origin` header.
+
+For official OAuth, put the authorization server in an external OIDC provider such as Auth0, Keycloak, Entra ID, or another provider that issues JWT access tokens and publishes JWKS. `ssh-gateway` validates those tokens and exposes `/.well-known/oauth-protected-resource` for clients that discover resource metadata:
+
+```yaml
+mcp:
+  listen: 127.0.0.1:8765
+  auth:
+    type: oauth_jwt
+    resource: https://gateway.example.com
+    issuer: https://idp.example.com
+    jwks_url: https://idp.example.com/.well-known/jwks.json
+    scopes: [ssh-gateway]
+  tenants:
+    - resource: https://gateway.example.com
+      config_path: tenants/main/profiles.yaml
+      local_file_root: /srv/ssh-gateway/main/files
+      profile_management:
+        enabled: false
+```
+
+Each tenant entry points to its own `profiles.yaml`. A request is accepted only when the access token signature, issuer, expiry, resource/audience, and required scopes validate. The matching tenant's config controls visible profiles, Agent Policy, profile management, approvals, grants, and local file-transfer root. If `jwks_url` is omitted, the gateway discovers it from `<issuer>/.well-known/openid-configuration`.
 
 ## ChatGPT setup
 
-Expose `/mcp` through an authenticated HTTPS route. In ChatGPT workspace settings, enable developer mode, create a custom MCP app, provide the HTTPS MCP URL and Bearer authentication, then scan tools. Current ChatGPT custom MCP availability and write-action confirmation depend on workspace plan and admin policy.
+Expose `/mcp` through an authenticated HTTPS route. In ChatGPT workspace settings, enable developer mode, create a custom MCP app, provide the HTTPS MCP URL and either Bearer or OAuth authentication, then scan tools. Current ChatGPT custom MCP availability and write-action confirmation depend on workspace plan and admin policy.
 
 Available tools: `list_hosts`, `get_profile_policy`, `exec`, `read_file`, `write_file`, `upload_file`, `download_file`, `list_sessions`, `close_session`, and `propose_plan`. When profile management is enabled, `create_profile` and `delete_profile` are also exposed. MCP always applies Agent Policy. `read_file` paginates by byte offset and caps one response at 256 KiB.
 

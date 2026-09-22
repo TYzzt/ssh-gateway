@@ -47,7 +47,8 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 - **Delegated `via_profile` mode**: reuse an upstream host's remote SSH capability when the final target is only reachable from that host.
 - **Managed remote agent lifecycle**: version checks, bootstrap, and reuse happen on connect.
 - **JSON-only CLI**: predictable automation surface for `daemon`, `profile`, `exec`, `read`, `write`, `upload`, `download`, `tunnel`, and `session`.
-- **Two agent interfaces**: local agents use CLI + Skill; remote agents use the bearer-authenticated Streamable HTTP MCP server.
+- **Two agent interfaces**: local agents use CLI + Skill; remote agents use the Streamable HTTP MCP server with static Bearer or OAuth JWT authentication.
+- **OAuth multi-tenant isolation for MCP**: external OIDC/JWT providers can route different audiences/resources to different profile files, local file roots, approval stores, and session namespaces.
 - **Agent Policy**: capability gates, exact command allowlists, and remotely resolved path restrictions apply to `--agent` CLI calls and every MCP call without changing legacy human CLI behavior.
 
 ## Security Model
@@ -234,6 +235,29 @@ ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.
 
 Local agents add `--agent`, for example `ssh-gateway exec --agent --profile aliyun -- docker ps`. See [Codex setup](docs/codex.md), [ChatGPT MCP setup](docs/chatgpt.md), and [NAS compose deployment](compose.yaml).
 
+## MCP OAuth and multi-tenant configs
+
+The MCP server keeps the existing static Bearer mode and also supports `oauth_jwt` for official OAuth-style MCP clients. In OAuth mode, `ssh-gateway` acts as a resource server: an external OIDC provider handles login and token issuance, while the gateway validates JWT signature, issuer, expiry, audience/resource, and required scopes.
+
+```yaml
+mcp:
+  listen: 127.0.0.1:8765
+  auth:
+    type: oauth_jwt
+    resource: https://gateway.example.com
+    issuer: https://idp.example.com
+    jwks_url: https://idp.example.com/.well-known/jwks.json
+    scopes: [ssh-gateway]
+  tenants:
+    - resource: https://gateway.example.com
+      config_path: tenants/main/profiles.yaml
+      local_file_root: /srv/ssh-gateway/main/files
+      profile_management:
+        enabled: false
+```
+
+Each tenant entry points to its own `profiles.yaml`. The authenticated token audience selects the tenant, and the matching tenant controls visible profiles, Agent Policy, profile management, approvals, grants, local file transfers, and reusable SSH sessions. See [ChatGPT MCP setup](docs/chatgpt.md) for deployment details.
+
 Relative local paths are resolved from the CLI caller's current working directory. This applies to `upload --src` and `download --dst`; the daemon rejects relative local paths at the RPC boundary and never resolves them from its own working directory. `.` and `..` in relative local paths are normalized before the request is sent. Windows drive-letter and UNC absolute paths are preserved.
 
 Uploads create remote parent directories and overwrite an existing remote destination. Downloads create local parent directories and atomically replace an existing local destination only after the complete content has been received and synced. Transfer JSON includes the resolved path pair: `local_src`/`remote_dst` for uploads and `remote_src`/`local_dst` for downloads. Download results also include `overwritten`.
@@ -348,8 +372,8 @@ The repository ships a tag-driven GitHub Actions workflow at [.github/workflows/
 Example:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 ## License

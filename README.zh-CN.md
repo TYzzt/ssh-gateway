@@ -43,7 +43,8 @@
 - **`via_profile` 委托模式**：当最终目标只能从上游主机访问时，复用上游主机已有的远端 SSH 能力。
 - **托管远端 agent 生命周期**：连接时自动做版本检查、安装和复用。
 - **JSON-only CLI**：统一覆盖 `daemon`、`profile`、`exec`、`read`、`write`、`upload`、`download`、`tunnel`、`session`。
-- **两类 Agent 接口**：本地 Agent 使用 CLI + Skill，远程 Agent 使用 Bearer 认证的 Streamable HTTP MCP。
+- **两类 Agent 接口**：本地 Agent 使用 CLI + Skill，远程 Agent 使用支持静态 Bearer 或 OAuth JWT 认证的 Streamable HTTP MCP。
+- **MCP OAuth 多租户隔离**：可接入外部 OIDC/JWT 提供方，并按 audience/resource 路由到不同的 profile 文件、本地文件根、审批存储和 session 命名空间。
 - **Agent Policy**：`--agent` CLI 和所有 MCP 调用统一执行 capability、精确命令白名单和远端真实路径限制，旧版 Human CLI 默认行为不变。
 
 Codex 本地接入见 [docs/codex.md](docs/codex.md)，ChatGPT MCP 与 NAS 部署见 [docs/chatgpt.md](docs/chatgpt.md)。
@@ -220,6 +221,29 @@ ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./loc
 ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
 ```
 
+## MCP OAuth 与多配置隔离
+
+MCP server 保留原有静态 Bearer 模式，同时支持 `oauth_jwt`，用于对接官方 OAuth 风格的 MCP 客户端。OAuth 模式下，`ssh-gateway` 作为 resource server 工作：外部 OIDC 提供方负责登录和签发 token，gateway 负责校验 JWT 签名、issuer、过期时间、audience/resource 和必需 scope。
+
+```yaml
+mcp:
+  listen: 127.0.0.1:8765
+  auth:
+    type: oauth_jwt
+    resource: https://gateway.example.com
+    issuer: https://idp.example.com
+    jwks_url: https://idp.example.com/.well-known/jwks.json
+    scopes: [ssh-gateway]
+  tenants:
+    - resource: https://gateway.example.com
+      config_path: tenants/main/profiles.yaml
+      local_file_root: /srv/ssh-gateway/main/files
+      profile_management:
+        enabled: false
+```
+
+每个 tenant 指向自己的 `profiles.yaml`。认证后的 token audience 会选择 tenant，匹配到的 tenant 决定可见 profiles、Agent Policy、profile 管理、审批、grants、本地文件传输根目录和可复用 SSH session。部署细节见 [ChatGPT MCP setup](docs/chatgpt.md)。
+
 本地相对路径以调用 CLI 时的当前工作目录为基准。该规则适用于 `upload --src` 和 `download --dst`；daemon 会在 RPC 边界拒绝相对本地路径，不会按自身工作目录解析。相对本地路径中的 `.` 和 `..` 会在发送请求前规范化；Windows 盘符绝对路径和 UNC 路径保持不变。
 
 上传会创建远端父目录并覆盖已有远端目标；下载会创建本地父目录，完整接收并同步内容后再原子替换已有本地目标。传输 JSON 会返回实际路径对：上传为 `local_src`/`remote_dst`，下载为 `remote_src`/`local_dst`；下载还会返回 `overwritten`。
@@ -334,8 +358,8 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 示例：
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
 ## 许可证

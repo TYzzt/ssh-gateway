@@ -4,7 +4,7 @@ When a tool returns `status: confirmation_required`, stop and report its ID, sum
 
 Use the stable task ID assigned to the current task. After a human creates a task grant, continue normally; never request wildcard scope, extend grants, switch task IDs, or use another task's grant. Agents may propose an ordered Plan, but must never approve or alter it and must execute approved actions in order.
 
-Codex should use the local `ssh-gateway` Skill and CLI. MCP is not required for this workflow.
+Codex should use the local `ssh-gateway` Skill and CLI. MCP is not required for this workflow. If Codex is connected through MCP instead, configure `/mcp` as a custom MCP server and use either the static Bearer token mode or OAuth mode backed by an external OIDC provider.
 
 ## Install
 

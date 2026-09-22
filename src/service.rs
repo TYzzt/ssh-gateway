@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
+const DEFAULT_SESSION_NAMESPACE: &str = "default";
+
 #[derive(Debug, Serialize)]
 pub struct PublicProfileInfo {
     pub name: String,
@@ -54,7 +56,7 @@ impl GatewayService {
                         .sessions
                         .lock()
                         .await
-                        .reap_idle_sessions(&config)
+                        .reap_idle_sessions(&config, DEFAULT_SESSION_NAMESPACE)
                         .await;
                 }
             }
@@ -69,6 +71,27 @@ impl GatewayService {
         let started = Instant::now();
         let _config_guard = self.config_access.read().await;
         let config = AppConfig::load().await?;
+        self.list_hosts_with_config(request_id, caller, &config, started)
+            .await
+    }
+
+    pub async fn list_hosts_for_config(
+        &self,
+        request_id: &str,
+        caller: CallerType,
+        config: &AppConfig,
+    ) -> Result<Vec<PublicProfileInfo>, ArrtError> {
+        self.list_hosts_with_config(request_id, caller, config, Instant::now())
+            .await
+    }
+
+    async fn list_hosts_with_config(
+        &self,
+        request_id: &str,
+        caller: CallerType,
+        config: &AppConfig,
+        started: Instant,
+    ) -> Result<Vec<PublicProfileInfo>, ArrtError> {
         let redactor = SecretRedactor::from_config(&config);
         let hosts = config
             .profiles
@@ -146,6 +169,56 @@ impl GatewayService {
             Some(self.config_access.read().await)
         };
         let config = AppConfig::load().await;
+        self.execute_loaded(
+            request_id,
+            caller,
+            task_id,
+            request,
+            started,
+            config,
+            DEFAULT_SESSION_NAMESPACE,
+        )
+        .await
+    }
+
+    pub async fn execute_for_config(
+        &self,
+        request_id: &str,
+        caller: CallerType,
+        task_id: Option<String>,
+        request: Request,
+        config: AppConfig,
+        session_namespace: &str,
+    ) -> CommandResult {
+        let started = Instant::now();
+        if let Err(err) = prevalidate(&request) {
+            return error_result(err, &request);
+        }
+        if let Err(err) = PolicyEngine::authorize_caller(caller, &request) {
+            return error_result(err, &request);
+        }
+        self.execute_loaded(
+            request_id,
+            caller,
+            task_id,
+            request,
+            started,
+            Ok(config),
+            session_namespace,
+        )
+        .await
+    }
+
+    async fn execute_loaded(
+        &self,
+        request_id: &str,
+        caller: CallerType,
+        task_id: Option<String>,
+        request: Request,
+        started: Instant,
+        config: Result<AppConfig, ArrtError>,
+        session_namespace: &str,
+    ) -> CommandResult {
         let mut result = match config {
             Ok(config) => {
                 let redactor = match &request {
@@ -158,8 +231,13 @@ impl GatewayService {
                     request,
                     Request::ProfileCreate { .. } | Request::ProfileDelete { .. }
                 ) {
-                    self.execute_mcp_profile_management(&config, caller, request.clone())
-                        .await
+                    self.execute_mcp_profile_management(
+                        &config,
+                        caller,
+                        request.clone(),
+                        session_namespace,
+                    )
+                    .await
                 } else if matches!(
                     request,
                     Request::ApprovalList
@@ -177,8 +255,13 @@ impl GatewayService {
                         | Request::PlanApprove { .. }
                         | Request::PlanReject { .. }
                 ) {
-                    self.execute_authorization_admin(&config, caller, request.clone())
-                        .await
+                    self.execute_authorization_admin(
+                        &config,
+                        caller,
+                        request.clone(),
+                        session_namespace,
+                    )
+                    .await
                 } else {
                     self.resolve_operation(
                         &config,
@@ -186,6 +269,7 @@ impl GatewayService {
                         task_id.as_deref(),
                         request.clone(),
                         &redactor,
+                        session_namespace,
                     )
                     .await
                 };
@@ -209,6 +293,7 @@ impl GatewayService {
         config: &AppConfig,
         caller: CallerType,
         request: Request,
+        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
         if caller != CallerType::Mcp {
             return Err(ArrtError::PolicyDenied(
@@ -231,7 +316,12 @@ impl GatewayService {
             }
             Request::ProfileDelete { profile, .. } => {
                 ensure_profile_deletable(config, &profile)?;
-                if self.sessions.lock().await.has_profile_session(&profile) {
+                if self
+                    .sessions
+                    .lock()
+                    .await
+                    .has_profile_session(session_namespace, &profile)
+                {
                     return Err(ArrtError::ProfileInUse(format!(
                         "profile {profile} has an active session"
                     )));
@@ -247,13 +337,15 @@ impl GatewayService {
                 ))
             }
         };
-        self.execute_profile_mutation(config, request).await
+        self.execute_profile_mutation(config, request, session_namespace)
+            .await
     }
 
     async fn execute_profile_mutation(
         &self,
         config: &AppConfig,
         request: Request,
+        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
         let _guard = self.config_access.write().await;
         let mut config = config.reload_if_file_backed().await?;
@@ -284,7 +376,7 @@ impl GatewayService {
                     )));
                 }
                 let sessions = self.sessions.lock().await;
-                if sessions.has_profile_session(&profile) {
+                if sessions.has_profile_session(session_namespace, &profile) {
                     return Err(ArrtError::ProfileInUse(format!(
                         "profile {profile} has an active session"
                     )));
@@ -308,6 +400,7 @@ impl GatewayService {
         task_id: Option<&str>,
         request: Request,
         redactor: &SecretRedactor,
+        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
         let decision = PolicyEngine::authorize(config, caller, &request)?;
         if decision.effect == PolicyEffect::Deny {
@@ -320,7 +413,9 @@ impl GatewayService {
         if decision.effect == PolicyEffect::Allow
             && (!caller.enforces_agent_policy() || task_id.is_none() || !config.approval.enabled)
         {
-            return self.execute_authorized(config, caller, request).await;
+            return self
+                .execute_authorized(config, caller, request, session_namespace)
+                .await;
         }
         let grants = GrantService::from_config(config)?;
         let profile = request_profile(&request).unwrap_or_default();
@@ -331,11 +426,21 @@ impl GatewayService {
         };
         if let Some(plan) = plan {
             return self
-                .execute_enveloped(config, caller, request, Some(plan), None, &grants)
+                .execute_enveloped(
+                    config,
+                    caller,
+                    request,
+                    Some(plan),
+                    None,
+                    &grants,
+                    session_namespace,
+                )
                 .await;
         }
         if decision.effect == PolicyEffect::Allow {
-            return self.execute_authorized(config, caller, request).await;
+            return self
+                .execute_authorized(config, caller, request, session_namespace)
+                .await;
         }
         let rule_id = decision
             .rule_id
@@ -343,7 +448,15 @@ impl GatewayService {
             .ok_or_else(|| ArrtError::PolicyDenied("confirm decision has no rule id".into()))?;
         if let Some(grant_id) = grants.consume(profile, rule_id, task_id)? {
             return self
-                .execute_enveloped(config, caller, request, None, Some(grant_id), &grants)
+                .execute_enveloped(
+                    config,
+                    caller,
+                    request,
+                    None,
+                    Some(grant_id),
+                    &grants,
+                    session_namespace,
+                )
                 .await;
         }
         let approval = ApprovalService::from_config(config)?.create(
@@ -368,8 +481,11 @@ impl GatewayService {
         plan: Option<PlanAuthorization>,
         grant_id: Option<String>,
         grants: &GrantService,
+        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
-        let result = self.execute_authorized(config, caller, request).await;
+        let result = self
+            .execute_authorized(config, caller, request, session_namespace)
+            .await;
         if let Some(auth) = plan {
             let success = result.as_ref().is_ok_and(|r| r.ok);
             let event = grants.finish_plan_action(&auth, success)?;
@@ -405,6 +521,7 @@ impl GatewayService {
         config: &AppConfig,
         caller: CallerType,
         request: Request,
+        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
         if matches!(request, Request::PlanPropose { .. }) {
             if caller == CallerType::HumanCli {
@@ -487,10 +604,13 @@ impl GatewayService {
                 if matches!(&claim.request, Request::ProfileCreate { .. } | Request::ProfileDelete { .. }) {
                     audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
                     let mut result = self
-                        .execute_profile_mutation(config, claim.request.clone())
+                        .execute_profile_mutation(config, claim.request.clone(), session_namespace)
                         .await
                         .unwrap_or_else(|err| error_result(err, &claim.request));
-                    let current_config = AppConfig::load().await.unwrap_or_else(|_| config.clone());
+                    let current_config = config
+                        .reload_if_file_backed()
+                        .await
+                        .unwrap_or_else(|_| config.clone());
                     let redactor = match &claim.request {
                         Request::ProfileCreate { profile } => {
                             SecretRedactor::from_config_and_profile(&current_config, profile)
@@ -536,7 +656,12 @@ impl GatewayService {
                 }
                 audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
                 let mut result = self
-                    .execute_authorized(&current_config, claim.caller, claim.request.clone())
+                    .execute_authorized(
+                        &current_config,
+                        claim.caller,
+                        claim.request.clone(),
+                        session_namespace,
+                    )
                     .await
                     .unwrap_or_else(|e| error_result(e, &claim.request));
                 let redactor = SecretRedactor::from_config(&current_config);
@@ -576,6 +701,7 @@ impl GatewayService {
         config: &AppConfig,
         caller: CallerType,
         request: Request,
+        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
         match request {
             Request::Ping => Ok(CommandResult::success().with_data(json!({
@@ -629,9 +755,17 @@ impl GatewayService {
             } => {
                 let prepared = {
                     let mut sessions = self.sessions.lock().await;
-                    sessions.reap_idle_sessions(config).await;
+                    sessions.reap_idle_sessions(config, session_namespace).await;
                     sessions
-                        .prepare_exec(config, &profile, command, cwd, timeout_seconds, env)
+                        .prepare_exec(
+                            config,
+                            session_namespace,
+                            &profile,
+                            command,
+                            cwd,
+                            timeout_seconds,
+                            env,
+                        )
                         .await?
                 };
                 let session_id = prepared.session_id().to_string();
@@ -642,8 +776,10 @@ impl GatewayService {
             Request::Read { profile, path } => {
                 let roots = allowed_remote_paths(config, caller, &profile, false)?;
                 let mut sessions = self.sessions.lock().await;
-                sessions.reap_idle_sessions(config).await;
-                sessions.read(config, &profile, path, &roots).await
+                sessions.reap_idle_sessions(config, session_namespace).await;
+                sessions
+                    .read(config, session_namespace, &profile, path, &roots)
+                    .await
             }
             Request::Write {
                 profile,
@@ -653,24 +789,28 @@ impl GatewayService {
             } => {
                 let roots = allowed_remote_paths(config, caller, &profile, true)?;
                 let mut sessions = self.sessions.lock().await;
-                sessions.reap_idle_sessions(config).await;
+                sessions.reap_idle_sessions(config, session_namespace).await;
                 sessions
-                    .write(config, &profile, path, mode, content_b64, &roots)
+                    .write(config, session_namespace, &profile, path, mode, content_b64, &roots)
                     .await
             }
             Request::Upload { profile, src, dst } => {
                 absolute_local_path(src.clone(), "upload src")?;
                 let roots = allowed_remote_paths(config, caller, &profile, true)?;
                 let mut sessions = self.sessions.lock().await;
-                sessions.reap_idle_sessions(config).await;
-                sessions.upload(config, &profile, src, dst, &roots).await
+                sessions.reap_idle_sessions(config, session_namespace).await;
+                sessions
+                    .upload(config, session_namespace, &profile, src, dst, &roots)
+                    .await
             }
             Request::Download { profile, src, dst } => {
                 absolute_local_path(dst.clone(), "download dst")?;
                 let roots = allowed_remote_paths(config, caller, &profile, false)?;
                 let mut sessions = self.sessions.lock().await;
-                sessions.reap_idle_sessions(config).await;
-                sessions.download(config, &profile, src, dst, &roots).await
+                sessions.reap_idle_sessions(config, session_namespace).await;
+                sessions
+                    .download(config, session_namespace, &profile, src, dst, &roots)
+                    .await
             }
             Request::TunnelOpen {
                 profile,
@@ -679,35 +819,46 @@ impl GatewayService {
                 remote_port,
             } => {
                 let mut sessions = self.sessions.lock().await;
-                sessions.reap_idle_sessions(config).await;
+                sessions.reap_idle_sessions(config, session_namespace).await;
                 sessions
-                    .tunnel_open(config, &profile, local_port, remote_host, remote_port)
+                    .tunnel_open(
+                        config,
+                        session_namespace,
+                        &profile,
+                        local_port,
+                        remote_host,
+                        remote_port,
+                    )
                     .await
             }
             Request::TunnelClose { tunnel_id, profile } => {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(expected_profile) = profile {
-                    if sessions.tunnel_profile(&tunnel_id) != Some(expected_profile.as_str()) {
+                    if sessions.tunnel_profile(session_namespace, &tunnel_id)
+                        != Some(expected_profile.as_str())
+                    {
                         return Err(ArrtError::PolicyDenied(
                             "tunnel does not belong to the supplied profile".to_string(),
                         ));
                     }
                 }
-                sessions.tunnel_close(config, &tunnel_id).await
+                sessions
+                    .tunnel_close(config, session_namespace, &tunnel_id)
+                    .await
             }
             Request::SessionList => Ok(CommandResult::success().with_data(json!({
-                "sessions": self.sessions.lock().await.sessions_json()
+                "sessions": self.sessions.lock().await.sessions_json(session_namespace)
             }))),
             Request::SessionInspect { session_id } => {
                 Ok(CommandResult::success().with_data(json!({
-                    "session": self.sessions.lock().await.session_json(&session_id)?
+                    "session": self.sessions.lock().await.session_json(session_namespace, &session_id)?
                 })))
             }
             Request::SessionClose { session_id } => {
                 self.sessions
                     .lock()
                     .await
-                    .close_session(config, &session_id)
+                    .close_session(config, session_namespace, &session_id)
                     .await?;
                 Ok(CommandResult::success().with_data(json!({"closed": session_id})))
             }
@@ -1024,6 +1175,7 @@ mod tests {
                 Some("task"),
                 request,
                 &SecretRedactor::from_config(&config),
+                DEFAULT_SESSION_NAMESPACE,
             )
             .await;
         assert!(matches!(result, Err(ArrtError::PolicyDenied(_))));
@@ -1078,6 +1230,7 @@ mod tests {
                     grant_task_id: Some("task".into()),
                     max_uses: Some(2),
                 },
+                DEFAULT_SESSION_NAMESPACE,
             )
             .await
             .unwrap();
@@ -1139,6 +1292,7 @@ mod tests {
                     grant_task_id: None,
                     max_uses: Some(10),
                 },
+                DEFAULT_SESSION_NAMESPACE,
             )
             .await
             .unwrap();
@@ -1177,6 +1331,7 @@ mod tests {
                 &config,
                 CallerType::Mcp,
                 Request::ProfilePolicy { profile: None },
+                DEFAULT_SESSION_NAMESPACE,
             )
             .await
             .unwrap();
@@ -1228,6 +1383,7 @@ mod tests {
                     grant_task_id: None,
                     max_uses: Some(2),
                 },
+                DEFAULT_SESSION_NAMESPACE,
             )
             .await;
         assert!(matches!(result, Err(ArrtError::PolicyDenied(_))));

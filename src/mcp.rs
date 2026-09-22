@@ -1,18 +1,23 @@
-use crate::config::{AppConfig, Profile};
+use crate::config::{AppConfig, McpTenantConfig, Profile};
 use crate::errors::ArrtError;
 use crate::protocol::{CallerType, Request, WriteMode};
 use crate::service::GatewayService;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 const MCP_PROTOCOL_CURRENT: &str = "2026-07-28";
 const MCP_PROTOCOL_COMPAT: &str = "2025-11-25";
@@ -21,11 +26,86 @@ const MAX_READ_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 struct McpState {
     service: Arc<GatewayService>,
-    token: Arc<str>,
+    auth: Arc<McpAuthState>,
     allowed_origins: Arc<Vec<String>>,
     local_file_root: Option<Arc<PathBuf>>,
     task_id: Option<Arc<str>>,
     profile_management_enabled: bool,
+}
+
+enum McpAuthState {
+    Bearer { token: Arc<str> },
+    OAuth(OAuthState),
+}
+
+struct OAuthState {
+    resource: Arc<str>,
+    issuer: Arc<str>,
+    jwks_url: Arc<str>,
+    required_scopes: Arc<Vec<String>>,
+    audience_claim: Arc<str>,
+    tenants: Arc<Vec<TenantRuntime>>,
+    client: Client,
+    jwks: RwLock<Option<JwksCache>>,
+}
+
+#[derive(Clone)]
+struct TenantRuntime {
+    resource: Arc<str>,
+    config_path: Arc<PathBuf>,
+    local_file_root: Option<Arc<PathBuf>>,
+    task_id: Option<Arc<str>>,
+    profile_management: Option<bool>,
+}
+
+struct JwksCache {
+    keys: Vec<Jwk>,
+    fetched_at: Instant,
+}
+
+#[derive(Clone, Deserialize)]
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Clone, Deserialize)]
+struct Jwk {
+    kid: Option<String>,
+    kty: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JwtClaims {
+    iss: String,
+    #[serde(default, rename = "sub")]
+    _sub: Option<String>,
+    aud: Option<Audience>,
+    #[serde(rename = "exp")]
+    _exp: usize,
+    scope: Option<String>,
+    scp: Option<ScopeClaim>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScopeClaim {
+    Text(String),
+    Many(Vec<String>),
+}
+
+struct AuthContext {
+    tenant: Option<TenantRuntime>,
 }
 
 #[derive(Deserialize)]
@@ -45,23 +125,7 @@ pub async fn serve_with_service(
 ) -> Result<(), ArrtError> {
     service.start_maintenance();
     let config = AppConfig::load().await?;
-    if !config.mcp.auth.kind.eq_ignore_ascii_case("bearer") {
-        return Err(ArrtError::Config(format!(
-            "unsupported mcp.auth.type: {}",
-            config.mcp.auth.kind
-        )));
-    }
-    let token = std::env::var(&config.mcp.auth.token_env).map_err(|_| {
-        ArrtError::Config(format!(
-            "MCP bearer token environment variable {} is not set",
-            config.mcp.auth.token_env
-        ))
-    })?;
-    if token.is_empty() {
-        return Err(ArrtError::Config(
-            "MCP bearer token must not be empty".to_string(),
-        ));
-    }
+    let auth = Arc::new(build_auth_state(&config).await?);
     let listen = listen_override.unwrap_or(config.mcp.listen.clone());
     let address: SocketAddr = listen
         .parse()
@@ -105,7 +169,7 @@ pub async fn serve_with_service(
         .transpose()?;
     let state = McpState {
         service,
-        token: token.into(),
+        auth,
         allowed_origins: Arc::new(config.mcp.allowed_origins),
         local_file_root,
         task_id,
@@ -126,6 +190,10 @@ fn app(state: McpState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(health))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource),
+        )
         .route("/mcp", post(mcp_post).get(mcp_get))
         .with_state(state)
 }
@@ -150,6 +218,20 @@ async fn health() -> Json<Value> {
     Json(json!({"status":"ok", "version": env!("CARGO_PKG_VERSION")}))
 }
 
+async fn oauth_protected_resource(State(state): State<McpState>) -> Response {
+    let McpAuthState::OAuth(oauth) = state.auth.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(json!({
+        "resource": oauth.resource.as_ref(),
+        "authorization_servers": [oauth.issuer.as_ref()],
+        "scopes_supported": oauth.required_scopes.as_ref(),
+        "bearer_methods_supported": ["header"],
+        "resource_documentation": "https://github.com/TYzzt/ssh-gateway"
+    }))
+    .into_response()
+}
+
 async fn mcp_get() -> Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,
@@ -163,13 +245,6 @@ async fn mcp_post(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
-    if !authorized(&headers, &state.token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"unauthorized"})),
-        )
-            .into_response();
-    }
     if !origin_allowed(&headers, &state.allowed_origins) {
         return (
             StatusCode::FORBIDDEN,
@@ -177,6 +252,10 @@ async fn mcp_post(
         )
             .into_response();
     }
+    let auth = match authenticate(&headers, &state).await {
+        Ok(auth) => auth,
+        Err(challenge) => return unauthorized_response(challenge),
+    };
 
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let Some(method) = payload.get("method").and_then(Value::as_str) else {
@@ -194,7 +273,7 @@ async fn mcp_post(
         "ping" => json!({}),
         "tools/list" => json!({
             "resultType": "complete",
-            "tools": tool_definitions(state.profile_management_enabled),
+            "tools": tool_definitions(profile_management_enabled(&state, &auth).await, security_schemes(&state)),
             "ttlMs": 300000,
             "cacheScope": "private"
         }),
@@ -205,7 +284,7 @@ async fn mcp_post(
                 Ok(call) => call,
                 Err(err) => return rpc_error(id, -32602, &format!("Invalid tool call: {err}")),
             };
-            return tool_response(id, call, state).await;
+            return tool_response(id, call, state, auth).await;
         }
         _ => return rpc_error(id, -32601, "Method not found"),
     };
@@ -223,6 +302,346 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
         return false;
     };
     constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+async fn build_auth_state(config: &AppConfig) -> Result<McpAuthState, ArrtError> {
+    if config.mcp.auth.kind.eq_ignore_ascii_case("bearer") {
+        let token = std::env::var(&config.mcp.auth.token_env).map_err(|_| {
+            ArrtError::Config(format!(
+                "MCP bearer token environment variable {} is not set",
+                config.mcp.auth.token_env
+            ))
+        })?;
+        if token.is_empty() {
+            return Err(ArrtError::Config(
+                "MCP bearer token must not be empty".to_string(),
+            ));
+        }
+        return Ok(McpAuthState::Bearer {
+            token: token.into(),
+        });
+    }
+    if !config.mcp.auth.kind.eq_ignore_ascii_case("oauth_jwt") {
+        return Err(ArrtError::Config(format!(
+            "unsupported mcp.auth.type: {}",
+            config.mcp.auth.kind
+        )));
+    }
+    build_oauth_state(config).await.map(McpAuthState::OAuth)
+}
+
+async fn build_oauth_state(config: &AppConfig) -> Result<OAuthState, ArrtError> {
+    let auth = &config.mcp.auth;
+    let resource = required_auth_value(auth.resource.as_deref(), "mcp.auth.resource")?;
+    let issuer = required_auth_value(auth.issuer.as_deref(), "mcp.auth.issuer")?;
+    let jwks_url = match auth.jwks_url.as_deref() {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => discover_jwks_url(issuer).await?,
+    };
+    let tenants = if config.mcp.tenants.is_empty() {
+        vec![TenantRuntime {
+            resource: Arc::from(resource),
+            config_path: Arc::new(config.source_path().to_path_buf()),
+            local_file_root: canonical_local_file_root(config.mcp.local_file_root.as_deref())?,
+            task_id: task_id_from_env(config.mcp.task_id_env.as_deref())?,
+            profile_management: Some(config.mcp.profile_management.enabled),
+        }]
+    } else {
+        config
+            .mcp
+            .tenants
+            .iter()
+            .map(|tenant| tenant_runtime(config.source_path(), tenant))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(OAuthState {
+        resource: Arc::from(resource),
+        issuer: Arc::from(issuer),
+        jwks_url: Arc::from(jwks_url),
+        required_scopes: Arc::new(auth.scopes.clone()),
+        audience_claim: Arc::from(auth.audience_claim.as_str()),
+        tenants: Arc::new(tenants),
+        client: Client::new(),
+        jwks: RwLock::new(None),
+    })
+}
+
+fn required_auth_value<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str, ArrtError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ArrtError::Config(format!("{name} is required for oauth_jwt")))
+}
+
+fn tenant_runtime(root_path: &Path, tenant: &McpTenantConfig) -> Result<TenantRuntime, ArrtError> {
+    let base = root_path.parent().unwrap_or_else(|| Path::new("."));
+    let path = PathBuf::from(&tenant.config_path);
+    let config_path = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    Ok(TenantRuntime {
+        resource: Arc::from(tenant.resource.as_str()),
+        config_path: Arc::new(config_path),
+        local_file_root: canonical_local_file_root(tenant.local_file_root.as_deref())?,
+        task_id: task_id_from_env(tenant.task_id_env.as_deref())?,
+        profile_management: tenant
+            .profile_management
+            .as_ref()
+            .map(|value| value.enabled),
+    })
+}
+
+fn canonical_local_file_root(root: Option<&str>) -> Result<Option<Arc<PathBuf>>, ArrtError> {
+    root.map(|root| {
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err(ArrtError::Config(
+                "mcp.local_file_root must be absolute".to_string(),
+            ));
+        }
+        std::fs::canonicalize(&root).map(Arc::new).map_err(|err| {
+            ArrtError::Config(format!(
+                "cannot resolve mcp.local_file_root {}: {err}",
+                root.display()
+            ))
+        })
+    })
+    .transpose()
+}
+
+fn task_id_from_env(name: Option<&str>) -> Result<Option<Arc<str>>, ArrtError> {
+    name.map(|name| {
+        std::env::var(name)
+            .map_err(|_| ArrtError::Config(format!("MCP task_id_env {name} is not set")))
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    Err(ArrtError::Config(format!(
+                        "MCP task_id_env {name} must not be empty"
+                    )))
+                } else {
+                    Ok(Arc::<str>::from(value))
+                }
+            })
+    })
+    .transpose()
+}
+
+async fn discover_jwks_url(issuer: &str) -> Result<String, ArrtError> {
+    let issuer = issuer.trim_end_matches('/');
+    let url = format!("{issuer}/.well-known/openid-configuration");
+    let metadata: Value = Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| ArrtError::Config(format!("fetch OIDC metadata {url}: {err}")))?
+        .error_for_status()
+        .map_err(|err| ArrtError::Config(format!("fetch OIDC metadata {url}: {err}")))?
+        .json()
+        .await
+        .map_err(|err| ArrtError::Config(format!("parse OIDC metadata {url}: {err}")))?;
+    metadata
+        .get("jwks_uri")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ArrtError::Config(format!("OIDC metadata {url} has no jwks_uri")))
+}
+
+async fn authenticate(headers: &HeaderMap, state: &McpState) -> Result<AuthContext, AuthChallenge> {
+    match state.auth.as_ref() {
+        McpAuthState::Bearer { token } => {
+            if authorized(headers, token) {
+                Ok(AuthContext { tenant: None })
+            } else {
+                Err(AuthChallenge::bearer())
+            }
+        }
+        McpAuthState::OAuth(oauth) => authenticate_oauth(headers, oauth).await,
+    }
+}
+
+async fn authenticate_oauth(
+    headers: &HeaderMap,
+    oauth: &OAuthState,
+) -> Result<AuthContext, AuthChallenge> {
+    let token = bearer_token(headers).ok_or_else(|| oauth_challenge(oauth, None))?;
+    let header = decode_header(token).map_err(|_| oauth_challenge(oauth, Some("invalid_token")))?;
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| oauth_challenge(oauth, Some("invalid_token")))?;
+    let key = jwk_for_kid(oauth, kid)
+        .await
+        .map_err(|_| oauth_challenge(oauth, Some("invalid_token")))?;
+    let decoding_key = DecodingKey::from_rsa_components(
+        key.n.as_deref().unwrap_or_default(),
+        key.e.as_deref().unwrap_or_default(),
+    )
+    .map_err(|_| oauth_challenge(oauth, Some("invalid_token")))?;
+    let algorithm = header.alg;
+    if !matches!(
+        algorithm,
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
+    ) {
+        return Err(oauth_challenge(oauth, Some("invalid_token")));
+    }
+    let mut validation = Validation::new(algorithm);
+    validation.set_issuer(&[oauth.issuer.as_ref()]);
+    validation.validate_aud = false;
+    let claims = decode::<JwtClaims>(token, &decoding_key, &validation)
+        .map_err(|_| oauth_challenge(oauth, Some("invalid_token")))?
+        .claims;
+    if claims.iss != oauth.issuer.as_ref() {
+        return Err(oauth_challenge(oauth, Some("invalid_token")));
+    }
+    let audiences = claim_audiences(&claims, oauth.audience_claim.as_ref());
+    let scopes = claim_scopes(&claims);
+    if !oauth
+        .required_scopes
+        .iter()
+        .all(|scope| scopes.iter().any(|item| item == scope))
+    {
+        return Err(oauth_challenge(oauth, Some("insufficient_scope")));
+    }
+    let tenant = oauth
+        .tenants
+        .iter()
+        .find(|tenant| {
+            audiences
+                .iter()
+                .any(|audience| audience == tenant.resource.as_ref())
+        })
+        .cloned()
+        .ok_or_else(|| oauth_challenge(oauth, Some("invalid_token")))?;
+    Ok(AuthContext {
+        tenant: Some(tenant),
+    })
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+async fn jwk_for_kid(oauth: &OAuthState, kid: &str) -> Result<Jwk, ArrtError> {
+    if let Some(key) = cached_jwk(oauth, kid).await {
+        return Ok(key);
+    }
+    refresh_jwks(oauth).await?;
+    cached_jwk(oauth, kid)
+        .await
+        .ok_or_else(|| ArrtError::Config(format!("JWKS key not found: {kid}")))
+}
+
+async fn cached_jwk(oauth: &OAuthState, kid: &str) -> Option<Jwk> {
+    let guard = oauth.jwks.read().await;
+    let cache = guard.as_ref()?;
+    if cache.fetched_at.elapsed() > Duration::from_secs(300) {
+        return None;
+    }
+    cache
+        .keys
+        .iter()
+        .find(|key| key.kid.as_deref() == Some(kid) && key.kty.as_deref() == Some("RSA"))
+        .cloned()
+}
+
+async fn refresh_jwks(oauth: &OAuthState) -> Result<(), ArrtError> {
+    let jwks: Jwks = oauth
+        .client
+        .get(oauth.jwks_url.as_ref())
+        .send()
+        .await
+        .map_err(|err| ArrtError::Config(format!("fetch JWKS: {err}")))?
+        .error_for_status()
+        .map_err(|err| ArrtError::Config(format!("fetch JWKS: {err}")))?
+        .json()
+        .await
+        .map_err(|err| ArrtError::Config(format!("parse JWKS: {err}")))?;
+    *oauth.jwks.write().await = Some(JwksCache {
+        keys: jwks.keys,
+        fetched_at: Instant::now(),
+    });
+    Ok(())
+}
+
+fn claim_audiences(claims: &JwtClaims, audience_claim: &str) -> Vec<String> {
+    if audience_claim == "aud" {
+        return match &claims.aud {
+            Some(Audience::One(value)) => vec![value.clone()],
+            Some(Audience::Many(values)) => values.clone(),
+            None => Vec::new(),
+        };
+    }
+    match claims.extra.get(audience_claim) {
+        Some(Value::String(value)) => vec![value.clone()],
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn claim_scopes(claims: &JwtClaims) -> Vec<String> {
+    if let Some(scope) = &claims.scope {
+        return scope.split_whitespace().map(str::to_string).collect();
+    }
+    match &claims.scp {
+        Some(ScopeClaim::Text(value)) => value.split_whitespace().map(str::to_string).collect(),
+        Some(ScopeClaim::Many(values)) => values.clone(),
+        None => Vec::new(),
+    }
+}
+
+struct AuthChallenge {
+    header: String,
+}
+
+impl AuthChallenge {
+    fn bearer() -> Self {
+        Self {
+            header: "Bearer".to_string(),
+        }
+    }
+}
+
+fn oauth_challenge(oauth: &OAuthState, error: Option<&str>) -> AuthChallenge {
+    let mut header = format!(
+        "Bearer resource_metadata=\"{}\"",
+        oauth_resource_metadata_url(oauth.resource.as_ref())
+    );
+    if let Some(error) = error {
+        header.push_str(&format!(", error=\"{error}\""));
+    }
+    if !oauth.required_scopes.is_empty() {
+        header.push_str(&format!(", scope=\"{}\"", oauth.required_scopes.join(" ")));
+    }
+    AuthChallenge { header }
+}
+
+fn oauth_resource_metadata_url(resource: &str) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource",
+        resource.trim_end_matches('/')
+    )
+}
+
+fn unauthorized_response(challenge: AuthChallenge) -> Response {
+    let header = challenge.header.clone();
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error":"unauthorized","_meta":{"mcp/www_authenticate":challenge.header}})),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&header) {
+        response.headers_mut().insert("www-authenticate", value);
+    }
+    response
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -312,16 +731,15 @@ fn initialize_result(payload: &Value) -> Value {
     })
 }
 
-async fn tool_response(id: Value, call: ToolCall, state: McpState) -> Response {
+async fn tool_response(id: Value, call: ToolCall, state: McpState, auth: AuthContext) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let outcome = call_tool(
         &state.service,
-        state.local_file_root.as_deref().map(PathBuf::as_path),
-        state.task_id.as_deref(),
+        &state,
+        &auth,
         &request_id,
         &call.name,
         call.arguments,
-        state.profile_management_enabled,
     )
     .await;
     match outcome {
@@ -332,38 +750,63 @@ async fn tool_response(id: Value, call: ToolCall, state: McpState) -> Response {
 
 async fn call_tool(
     service: &GatewayService,
-    local_file_root: Option<&Path>,
-    task_id: Option<&str>,
+    state: &McpState,
+    auth: &AuthContext,
     request_id: &str,
     name: &str,
     args: Value,
-    profile_management_enabled: bool,
 ) -> Result<Value, String> {
     if name == "list_hosts" {
-        return service
-            .list_hosts(request_id, CallerType::Mcp)
-            .await
-            .map(|hosts| json!({"hosts": hosts}))
-            .map_err(|err| err.to_string());
+        return match load_tenant_config(auth).await? {
+            Some(config) => service
+                .list_hosts_for_config(request_id, CallerType::Mcp, &config)
+                .await
+                .map(|hosts| json!({"hosts": hosts}))
+                .map_err(|err| err.to_string()),
+            None => service
+                .list_hosts(request_id, CallerType::Mcp)
+                .await
+                .map(|hosts| json!({"hosts": hosts}))
+                .map_err(|err| err.to_string()),
+        };
     }
     if args.get("task_id").is_some() {
         return Err(
             "task_id is injected by the gateway and is not accepted as a tool argument".to_string(),
         );
     }
+    let profile_management_enabled = profile_management_enabled(state, auth).await;
     if matches!(name, "create_profile" | "delete_profile") && !profile_management_enabled {
         return Err("profile management is disabled".to_string());
     }
+    let local_file_root = local_file_root(state, auth);
     guard_local_transfer(name, &args, local_file_root)?;
+    let task_id = task_id(state, auth);
     let request = request_from_tool(name, &args, task_id)?;
-    let result = service
-        .execute(
-            request_id,
-            CallerType::Mcp,
-            task_id.map(str::to_string),
-            request,
-        )
-        .await;
+    let result = match load_tenant_config(auth).await? {
+        Some(config) => {
+            service
+                .execute_for_config(
+                    request_id,
+                    CallerType::Mcp,
+                    task_id.map(str::to_string),
+                    request,
+                    config,
+                    session_namespace(auth),
+                )
+                .await
+        }
+        None => {
+            service
+                .execute(
+                    request_id,
+                    CallerType::Mcp,
+                    task_id.map(str::to_string),
+                    request,
+                )
+                .await
+        }
+    };
     if result
         .data
         .as_ref()
@@ -392,6 +835,62 @@ async fn call_tool(
         }));
     }
     Ok(result.data.unwrap_or_else(|| json!({"ok": true})))
+}
+
+async fn load_tenant_config(auth: &AuthContext) -> Result<Option<AppConfig>, String> {
+    let Some(tenant) = &auth.tenant else {
+        return Ok(None);
+    };
+    AppConfig::load_from_path(tenant.config_path.as_ref().clone())
+        .await
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+fn local_file_root<'a>(state: &'a McpState, auth: &'a AuthContext) -> Option<&'a Path> {
+    auth.tenant
+        .as_ref()
+        .and_then(|tenant| tenant.local_file_root.as_deref())
+        .or_else(|| state.local_file_root.as_deref())
+        .map(PathBuf::as_path)
+}
+
+fn task_id<'a>(state: &'a McpState, auth: &'a AuthContext) -> Option<&'a str> {
+    auth.tenant
+        .as_ref()
+        .and_then(|tenant| tenant.task_id.as_deref())
+        .or(state.task_id.as_deref())
+}
+
+fn session_namespace<'a>(auth: &'a AuthContext) -> &'a str {
+    auth.tenant
+        .as_ref()
+        .map(|tenant| tenant.resource.as_ref())
+        .unwrap_or("default")
+}
+
+async fn profile_management_enabled(state: &McpState, auth: &AuthContext) -> bool {
+    if let Some(enabled) = auth
+        .tenant
+        .as_ref()
+        .and_then(|tenant| tenant.profile_management)
+    {
+        return enabled;
+    }
+    match load_tenant_config(auth).await {
+        Ok(Some(config)) => config.mcp.profile_management.enabled,
+        _ => state.profile_management_enabled,
+    }
+}
+
+fn security_schemes(state: &McpState) -> Option<Value> {
+    let McpAuthState::OAuth(oauth) = state.auth.as_ref() else {
+        return None;
+    };
+    Some(json!([{
+        "type": "oauth2",
+        "scopes": oauth.required_scopes.as_ref()
+    }]))
 }
 
 fn guard_local_transfer(name: &str, args: &Value, root: Option<&Path>) -> Result<(), String> {
@@ -718,7 +1217,10 @@ fn rpc_error(id: Value, code: i32, message: &str) -> Response {
         .into_response()
 }
 
-fn tool_definitions(profile_management_enabled: bool) -> Vec<Value> {
+fn tool_definitions(
+    profile_management_enabled: bool,
+    security_schemes: Option<Value>,
+) -> Vec<Value> {
     let profile =
         json!({"type":"string", "description":"Configured profile name", "x-mcp-header":"Profile"});
     let mut tools = vec![
@@ -786,6 +1288,12 @@ fn tool_definitions(profile_management_enabled: bool) -> Vec<Value> {
             json!({"type":"object","properties":{"profile":profile},"required":["profile"],"additionalProperties":false}),
             true,
         ));
+    }
+    if let Some(security_schemes) = security_schemes {
+        for tool in &mut tools {
+            tool["securitySchemes"] = security_schemes.clone();
+            tool["_meta"]["securitySchemes"] = security_schemes.clone();
+        }
     }
     tools
 }
@@ -881,7 +1389,7 @@ mod tests {
 
     #[test]
     fn approval_mutation_tools_are_not_exposed() {
-        let names = tool_definitions(true)
+        let names = tool_definitions(true, None)
             .into_iter()
             .filter_map(|value| value["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
@@ -894,13 +1402,13 @@ mod tests {
 
     #[test]
     fn profile_management_tools_follow_enablement() {
-        let disabled = tool_definitions(false);
+        let disabled = tool_definitions(false, None);
         assert!(disabled
             .iter()
             .any(|tool| tool["name"] == "get_profile_policy"));
         assert!(!disabled.iter().any(|tool| tool["name"] == "create_profile"));
         assert!(!disabled.iter().any(|tool| tool["name"] == "delete_profile"));
-        let enabled = tool_definitions(true);
+        let enabled = tool_definitions(true, None);
         assert!(enabled.iter().any(|tool| tool["name"] == "create_profile"));
         assert!(enabled.iter().any(|tool| tool["name"] == "delete_profile"));
         let create = enabled
@@ -919,7 +1427,7 @@ mod tests {
 
     #[test]
     fn profile_policy_tool_is_declared_read_only() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, None);
         let definition = tools
             .iter()
             .find(|tool| tool["name"] == "get_profile_policy")
@@ -928,6 +1436,44 @@ mod tests {
         assert_eq!(definition["annotations"]["destructiveHint"], false);
         assert_eq!(definition["annotations"]["idempotentHint"], true);
         assert_eq!(definition["annotations"]["openWorldHint"], false);
+    }
+
+    #[test]
+    fn oauth_security_schemes_are_added_to_tools() {
+        let tools = tool_definitions(
+            true,
+            Some(json!([{"type":"oauth2","scopes":["ssh-gateway"]}])),
+        );
+        assert!(tools
+            .iter()
+            .all(|tool| tool["securitySchemes"][0]["type"] == "oauth2"));
+    }
+
+    #[test]
+    fn oauth_claim_helpers_accept_audiences_and_scopes() {
+        let claims = JwtClaims {
+            iss: "https://idp.example.com".into(),
+            _sub: Some("user".into()),
+            aud: Some(Audience::Many(vec![
+                "https://a.example.com/mcp".into(),
+                "https://b.example.com/mcp".into(),
+            ])),
+            _exp: 4_102_444_800,
+            scope: Some("ssh-gateway other".into()),
+            scp: None,
+            extra: Map::new(),
+        };
+        assert_eq!(
+            claim_audiences(&claims, "aud"),
+            vec![
+                "https://a.example.com/mcp".to_string(),
+                "https://b.example.com/mcp".to_string()
+            ]
+        );
+        assert_eq!(
+            claim_scopes(&claims),
+            vec!["ssh-gateway".to_string(), "other".to_string()]
+        );
     }
 
     #[test]
@@ -963,7 +1509,7 @@ mod tests {
 
     #[test]
     fn mcp_tools_do_not_accept_agent_supplied_task_id() {
-        let tools = tool_definitions(true);
+        let tools = tool_definitions(true, None);
         for tool in &tools {
             let properties = &tool["inputSchema"]["properties"];
             assert!(properties.get("task_id").is_none());
@@ -996,7 +1542,9 @@ mod tests {
     async fn mcp_http_rejects_missing_bearer_token() {
         let state = McpState {
             service: GatewayService::new(),
-            token: "secret".into(),
+            auth: Arc::new(McpAuthState::Bearer {
+                token: "secret".into(),
+            }),
             allowed_origins: Arc::new(Vec::new()),
             local_file_root: None,
             task_id: None,

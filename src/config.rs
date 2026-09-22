@@ -184,6 +184,8 @@ pub struct McpConfig {
     #[serde(default)]
     pub auth: McpAuthConfig,
     #[serde(default)]
+    pub tenants: Vec<McpTenantConfig>,
+    #[serde(default)]
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub local_file_root: Option<String>,
@@ -205,6 +207,28 @@ pub struct McpAuthConfig {
     pub kind: String,
     #[serde(default = "default_token_env")]
     pub token_env: String,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default = "default_audience_claim")]
+    pub audience_claim: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct McpTenantConfig {
+    pub resource: String,
+    pub config_path: String,
+    #[serde(default)]
+    pub local_file_root: Option<String>,
+    #[serde(default)]
+    pub task_id_env: Option<String>,
+    #[serde(default)]
+    pub profile_management: Option<ProfileManagementConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -411,6 +435,10 @@ fn default_token_env() -> String {
     "SSH_GATEWAY_MCP_TOKEN".to_string()
 }
 
+fn default_audience_claim() -> String {
+    "aud".to_string()
+}
+
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
@@ -520,6 +548,11 @@ impl Default for McpAuthConfig {
         Self {
             kind: default_auth_type(),
             token_env: default_token_env(),
+            resource: None,
+            issuer: None,
+            jwks_url: None,
+            scopes: Vec::new(),
+            audience_claim: default_audience_claim(),
         }
     }
 }
@@ -529,6 +562,7 @@ impl Default for McpConfig {
         Self {
             listen: default_mcp_listen(),
             auth: McpAuthConfig::default(),
+            tenants: Vec::new(),
             allowed_origins: Vec::new(),
             local_file_root: None,
             task_id_env: None,
@@ -540,6 +574,10 @@ impl Default for McpConfig {
 impl AppConfig {
     pub async fn load() -> Result<Self, ArrtError> {
         let path = config_path()?;
+        Self::load_from_path(path).await
+    }
+
+    pub async fn load_from_path(path: PathBuf) -> Result<Self, ArrtError> {
         let raw = tokio::fs::read_to_string(&path).await.map_err(|err| {
             ArrtError::Config(format!("failed to read {}: {}", path.display(), err))
         })?;
@@ -552,9 +590,10 @@ impl AppConfig {
 
     pub fn validate(&self) -> Result<(), ArrtError> {
         let mut names = HashSet::new();
-        if self.profiles.is_empty() {
+        if self.profiles.is_empty() && self.mcp.tenants.is_empty() {
             return Err(ArrtError::Config("no profiles configured".to_string()));
         }
+        self.validate_mcp()?;
         for profile in &self.profiles {
             if !names.insert(profile.name.clone()) {
                 return Err(ArrtError::Config(format!(
@@ -581,6 +620,54 @@ impl AppConfig {
             return Err(ArrtError::Config(
                 "approval grant TTL and max uses must be greater than zero".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_mcp(&self) -> Result<(), ArrtError> {
+        if self.mcp.auth.kind.eq_ignore_ascii_case("bearer") {
+            return Ok(());
+        }
+        if !self.mcp.auth.kind.eq_ignore_ascii_case("oauth_jwt") {
+            return Err(ArrtError::Config(format!(
+                "unsupported mcp.auth.type: {}",
+                self.mcp.auth.kind
+            )));
+        }
+        let auth = &self.mcp.auth;
+        if auth.resource.as_deref().unwrap_or_default().is_empty() {
+            return Err(ArrtError::Config(
+                "mcp.auth.resource is required for oauth_jwt".into(),
+            ));
+        }
+        if auth.issuer.as_deref().unwrap_or_default().is_empty() {
+            return Err(ArrtError::Config(
+                "mcp.auth.issuer is required for oauth_jwt".into(),
+            ));
+        }
+        if auth.audience_claim.trim().is_empty() {
+            return Err(ArrtError::Config(
+                "mcp.auth.audience_claim must not be empty".into(),
+            ));
+        }
+        let mut resources = HashSet::new();
+        for tenant in &self.mcp.tenants {
+            if tenant.resource.trim().is_empty() {
+                return Err(ArrtError::Config(
+                    "mcp.tenants[].resource must not be empty".into(),
+                ));
+            }
+            if tenant.config_path.trim().is_empty() {
+                return Err(ArrtError::Config(
+                    "mcp.tenants[].config_path must not be empty".into(),
+                ));
+            }
+            if !resources.insert(tenant.resource.clone()) {
+                return Err(ArrtError::Config(format!(
+                    "duplicate mcp tenant resource: {}",
+                    tenant.resource
+                )));
+            }
         }
         Ok(())
     }
@@ -752,6 +839,10 @@ impl AppConfig {
 
     fn config_base_dir(&self) -> &Path {
         self.source_path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
     }
 }
 
@@ -1643,6 +1734,53 @@ mcp:
         let mut config = parse_config(raw, Path::new("profiles.yaml")).unwrap();
         set_base_dir(&mut config);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn oauth_jwt_supports_tenant_only_gateway_config() {
+        let raw = r#"
+mcp:
+  auth:
+    type: oauth_jwt
+    resource: https://gateway.example.com/mcp
+    issuer: https://idp.example.com
+    jwks_url: https://idp.example.com/jwks.json
+    scopes: [ssh-gateway]
+  tenants:
+    - resource: https://gateway.example.com/mcp
+      config_path: tenants/main/profiles.yaml
+      profile_management: {enabled: true}
+"#;
+        let mut config = parse_config(raw, Path::new("gateway.yaml")).unwrap();
+        set_base_dir(&mut config);
+        config.validate().unwrap();
+        assert_eq!(
+            config.mcp.tenants[0].config_path,
+            "tenants/main/profiles.yaml"
+        );
+    }
+
+    #[test]
+    fn oauth_jwt_rejects_duplicate_tenant_resources() {
+        let raw = r#"
+mcp:
+  auth:
+    type: oauth_jwt
+    resource: https://gateway.example.com/mcp
+    issuer: https://idp.example.com
+  tenants:
+    - resource: https://gateway.example.com/mcp
+      config_path: a.yaml
+    - resource: https://gateway.example.com/mcp
+      config_path: b.yaml
+"#;
+        let mut config = parse_config(raw, Path::new("gateway.yaml")).unwrap();
+        set_base_dir(&mut config);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate mcp tenant resource"));
     }
 
     #[tokio::test]
