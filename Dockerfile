@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -9,10 +9,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home gateway
-COPY --from=builder /src/target/release/ssh-gateway /usr/local/bin/ssh-gateway
+COPY --from=builder /src/target/release/sshmcp /usr/local/bin/sshmcp
 USER gateway
-ENV ARRT_CONFIG_PATH=/config/profiles.yaml
-ENV XDG_DATA_HOME=/tmp/ssh-gateway-data
+ENV SSHMCP_CONFIG_PATH=/config/profiles.yaml
+ENV XDG_DATA_HOME=/data
 EXPOSE 8765
-ENTRYPOINT ["ssh-gateway"]
+ENTRYPOINT ["sshmcp"]
 CMD ["serve"]

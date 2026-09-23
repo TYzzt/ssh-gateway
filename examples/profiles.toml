@@ -27,7 +27,7 @@ shell = "bash -lc"
 
 [profiles.agent]
 manage = true
-remote_path = "/tmp/ssh-gatewayd"
+remote_path = "/tmp/sshmcpd"
 version = "0.1.0"
 
 [profiles.bootstrap]

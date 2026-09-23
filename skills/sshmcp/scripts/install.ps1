@@ -1,16 +1,16 @@
 param(
     [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\ssh-gateway\bin",
+    [string]$InstallDir = "$env:LOCALAPPDATA\sshmcp\bin",
     [switch]$NoPathUpdate
 )
 
 $ErrorActionPreference = "Stop"
 
-$repo = "TYzzt/ssh-gateway"
-$binaryName = "ssh-gateway.exe"
+$repo = "sshmcp/sshmcp"
+$binaryName = "sshmcp.exe"
 $apiHeaders = @{
     "Accept" = "application/vnd.github+json"
-    "User-Agent" = "ssh-gateway-skill-installer"
+    "User-Agent" = "sshmcp-skill-installer"
 }
 
 if (-not $env:LOCALAPPDATA) {
@@ -93,14 +93,14 @@ else {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$versionTag" -Headers $apiHeaders
 }
 
-$assetName = "ssh-gateway-$versionTag-x86_64-pc-windows-msvc.zip"
+$assetName = "sshmcp-$versionTag-x86_64-pc-windows-msvc.zip"
 $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
 if (-not $asset) {
     throw "release asset not found: $assetName"
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ssh-gateway-install-" + [guid]::NewGuid().ToString("N"))
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sshmcp-install-" + [guid]::NewGuid().ToString("N"))
 $archivePath = Join-Path $tempRoot $assetName
 $extractDir = Join-Path $tempRoot "extract"
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
@@ -139,7 +139,7 @@ try {
             else { $null }
         }
         else {
-            "Add '$InstallDir' to PATH if you want to invoke ssh-gateway without an absolute path."
+            "Add '$InstallDir' to PATH if you want to invoke sshmcp without an absolute path."
         }
     } | ConvertTo-Json -Depth 4
 }

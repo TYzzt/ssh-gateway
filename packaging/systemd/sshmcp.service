@@ -1,0 +1,24 @@
+[Unit]
+Description=sshmcp agent-facing remote host gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sshmcp
+Group=sshmcp
+Environment=SSHMCP_CONFIG_PATH=/etc/sshmcp/profiles.yaml
+Environment=XDG_DATA_HOME=/var/lib/sshmcp
+EnvironmentFile=-/etc/sshmcp/environment
+ExecStart=/usr/local/bin/sshmcp serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sshmcp
+StateDirectory=sshmcp
+
+[Install]
+WantedBy=multi-user.target

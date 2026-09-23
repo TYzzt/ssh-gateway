@@ -13,8 +13,8 @@ use std::process::Stdio;
 use tokio::fs;
 
 #[derive(Parser, Debug)]
-#[command(name = "ssh-gateway")]
-#[command(about = "Agent Remote Runtime CLI")]
+#[command(name = "sshmcp")]
+#[command(about = "Secure remote access for AI agents")]
 #[command(version)]
 pub struct Cli {
     /// Apply profile agent policy to this invocation.
@@ -759,18 +759,18 @@ mod tests {
 
     #[test]
     fn version_flag_is_available() {
-        let error = Cli::try_parse_from(["ssh-gateway", "--version"]).unwrap_err();
+        let error = Cli::try_parse_from(["sshmcp", "--version"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
 
-        let short = Cli::try_parse_from(["ssh-gateway", "-V"]).unwrap_err();
+        let short = Cli::try_parse_from(["sshmcp", "-V"]).unwrap_err();
         assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]
     fn agent_flag_is_global_and_compatible_with_requested_position() {
         let before = Cli::try_parse_from([
-            "ssh-gateway",
+            "sshmcp",
             "--agent",
             "exec",
             "--profile",
@@ -780,7 +780,7 @@ mod tests {
         ])
         .unwrap();
         let after = Cli::try_parse_from([
-            "ssh-gateway",
+            "sshmcp",
             "exec",
             "--agent",
             "--profile",
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn parses_task_id_and_duration_syntax() {
         let cli = Cli::try_parse_from([
-            "ssh-gateway",
+            "sshmcp",
             "--agent",
             "--task-id",
             "task-a",
@@ -841,14 +841,14 @@ mod tests {
 
     #[test]
     fn transfer_help_explains_local_and_remote_paths() {
-        let upload = Cli::try_parse_from(["ssh-gateway", "upload", "--help"])
+        let upload = Cli::try_parse_from(["sshmcp", "upload", "--help"])
             .unwrap_err()
             .to_string();
         assert!(upload.contains("Local source file"));
         assert!(upload.contains("Remote destination file"));
         assert!(upload.contains("overwritten"));
 
-        let download = Cli::try_parse_from(["ssh-gateway", "download", "--help"])
+        let download = Cli::try_parse_from(["sshmcp", "download", "--help"])
             .unwrap_err()
             .to_string();
         assert!(download.contains("Remote source file"));

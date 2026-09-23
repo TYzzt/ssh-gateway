@@ -157,11 +157,7 @@ impl EmbeddedSession {
     pub async fn disconnect(&self) {
         for handle in self.handles.iter().rev() {
             let _ = handle
-                .disconnect(
-                    Disconnect::ByApplication,
-                    "ssh-gateway session closed",
-                    "en",
-                )
+                .disconnect(Disconnect::ByApplication, "sshmcp session closed", "en")
                 .await;
         }
     }
@@ -552,12 +548,12 @@ mod tests {
     #[test]
     fn shell_join_quotes_arguments() {
         let command = shell_join(&[
-            "/tmp/ssh-gatewayd".to_string(),
+            "/tmp/sshmcpd".to_string(),
             "exec".to_string(),
             "hello world".to_string(),
             "quote'check".to_string(),
         ]);
-        assert!(command.contains("'/tmp/ssh-gatewayd'"));
+        assert!(command.contains("'/tmp/sshmcpd'"));
         assert!(command.contains("'hello world'"));
         assert!(command.contains("'quote'\\''check'"));
     }
@@ -572,7 +568,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time before epoch")
             .as_nanos();
-        let key_path = std::env::temp_dir().join(format!("ssh-gateway-passphrase-test-{nonce}"));
+        let key_path = std::env::temp_dir().join(format!("sshmcp-passphrase-test-{nonce}"));
         let passphrase = "test-passphrase";
 
         let output = Command::new("ssh-keygen")
@@ -584,7 +580,7 @@ mod tests {
                 "-f",
                 key_path.to_str().expect("temp path must be utf-8"),
                 "-C",
-                "ssh-gateway-test",
+                "sshmcp-test",
                 "-q",
             ])
             .output()

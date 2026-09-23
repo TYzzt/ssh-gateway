@@ -32,7 +32,7 @@ impl SecretRedactor {
                 }
             }
         }
-        if let Ok(token) = std::env::var(&config.mcp.auth.token_env) {
+        if let Ok(token) = crate::config::env_with_legacy(&config.mcp.auth.token_env) {
             push_secret(&mut secrets, token);
         }
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));

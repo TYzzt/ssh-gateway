@@ -9,9 +9,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-const APP_QUALIFIER: &str = "opensource";
-const APP_ORG: &str = "opensource";
-const APP_NAME: &str = "ssh-gateway";
+const APP_QUALIFIER: &str = "";
+const APP_ORG: &str = "";
+const APP_NAME: &str = "sshmcp";
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AppConfig {
@@ -402,7 +402,7 @@ fn default_agent_enabled() -> bool {
 }
 
 fn default_agent_remote_path() -> String {
-    "/tmp/ssh-gatewayd".to_string()
+    "/tmp/sshmcpd".to_string()
 }
 
 fn default_agent_version() -> String {
@@ -474,7 +474,7 @@ fn default_auth_type() -> String {
 }
 
 fn default_token_env() -> String {
-    "SSH_GATEWAY_MCP_TOKEN".to_string()
+    "SSHMCP_MCP_TOKEN".to_string()
 }
 
 fn default_audience_claim() -> String {
@@ -1384,8 +1384,44 @@ impl ResolvedProfile {
 }
 
 pub fn project_dirs() -> Result<ProjectDirs, ArrtError> {
-    ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
-        .ok_or_else(|| ArrtError::Config("failed to resolve application directories".to_string()))
+    let current = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME).ok_or_else(|| {
+        ArrtError::Config("failed to resolve application directories".to_string())
+    })?;
+    let legacy = ProjectDirs::from("opensource", "opensource", "ssh-gateway")
+        .ok_or_else(|| ArrtError::Config("failed to resolve legacy directories".to_string()))?;
+    if current.data_local_dir().exists() {
+        return Ok(current);
+    }
+    if legacy.data_local_dir().exists() {
+        return Ok(legacy);
+    }
+    if let Some(arrt) = ProjectDirs::from("opensource", "opensource", "arrt") {
+        if arrt.data_local_dir().exists() {
+            return Ok(arrt);
+        }
+    }
+    Ok(current)
+}
+
+fn env_value_with_legacy<F: Fn(&str) -> Option<String>>(name: &str, lookup: F) -> Option<String> {
+    let names: &[&str] = match name {
+        "SSHMCP_CONFIG_PATH" | "SSH_GATEWAY_CONFIG_PATH" | "ARRT_CONFIG_PATH" => &[
+            "SSHMCP_CONFIG_PATH",
+            "SSH_GATEWAY_CONFIG_PATH",
+            "ARRT_CONFIG_PATH",
+        ],
+        "SSHMCP_MCP_TOKEN" | "SSH_GATEWAY_MCP_TOKEN" => {
+            &["SSHMCP_MCP_TOKEN", "SSH_GATEWAY_MCP_TOKEN"]
+        }
+        "SSHMCP_TASK_ID" | "SSH_GATEWAY_TASK_ID" => &["SSHMCP_TASK_ID", "SSH_GATEWAY_TASK_ID"],
+        _ => std::slice::from_ref(&name),
+    };
+    names.iter().find_map(|candidate| lookup(candidate))
+}
+
+pub fn env_with_legacy(name: &str) -> Result<String, std::env::VarError> {
+    env_value_with_legacy(name, |candidate| std::env::var(candidate).ok())
+        .ok_or(std::env::VarError::NotPresent)
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -1398,39 +1434,38 @@ pub fn ensure_runtime_dirs() -> Result<PathBuf, ArrtError> {
 }
 
 pub fn config_path() -> Result<PathBuf, ArrtError> {
-    if let Ok(override_path) = std::env::var("SSH_GATEWAY_CONFIG_PATH") {
+    if let Some(override_path) =
+        env_value_with_legacy("SSHMCP_CONFIG_PATH", |name| std::env::var(name).ok())
+    {
         let path = PathBuf::from(override_path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         return Ok(path);
     }
-    if let Ok(override_path) = std::env::var("ARRT_CONFIG_PATH") {
-        let path = PathBuf::from(override_path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let current = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME).ok_or_else(|| {
+        ArrtError::Config("failed to resolve application directories".to_string())
+    })?;
+    let legacy = ProjectDirs::from("opensource", "opensource", "ssh-gateway")
+        .ok_or_else(|| ArrtError::Config("failed to resolve legacy directories".to_string()))?;
+    let mut dirs = vec![
+        current.config_dir().to_path_buf(),
+        legacy.config_dir().to_path_buf(),
+    ];
+    if let Some(arrt) = ProjectDirs::from("opensource", "opensource", "arrt") {
+        dirs.push(arrt.config_dir().to_path_buf());
+    }
+    for dir in &dirs {
+        for name in ["profiles.yaml", "profiles.yml", "profiles.toml"] {
+            let path = dir.join(name);
+            if path.exists() {
+                return Ok(path);
+            }
         }
-        return Ok(path);
     }
-    let dirs = project_dirs()?;
-    let config_dir = dirs.config_dir();
-    std::fs::create_dir_all(config_dir)?;
-    let yaml_path = config_dir.join("profiles.yaml");
-    let yml_path = config_dir.join("profiles.yml");
-    let toml_path = config_dir.join("profiles.toml");
-    if yaml_path.exists() {
-        return Ok(yaml_path);
-    }
-    if yml_path.exists() {
-        return Ok(yml_path);
-    }
-    if toml_path.exists() {
-        return Ok(toml_path);
-    }
-    if let Some(parent) = yaml_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(yaml_path)
+    let path = dirs[0].join("profiles.yaml");
+    std::fs::create_dir_all(&dirs[0])?;
+    Ok(path)
 }
 
 pub fn config_path_display() -> Result<String, ArrtError> {
@@ -1549,7 +1584,7 @@ mod tests {
             _ => panic!("expected key auth"),
         }
         assert_eq!(target.port, 22);
-        assert_eq!(resolved.agent.remote_path, "/tmp/ssh-gatewayd");
+        assert_eq!(resolved.agent.remote_path, "/tmp/sshmcpd");
     }
 
     #[test]
@@ -1930,7 +1965,7 @@ mcp:
     resource: https://gateway.example.com/mcp
     issuer: https://idp.example.com
     jwks_url: https://idp.example.com/jwks.json
-    scopes: [ssh-gateway]
+    scopes: [sshmcp]
   tenants:
     - resource: https://gateway.example.com/mcp
       config_path: tenants/main/profiles.yaml
@@ -1971,7 +2006,7 @@ mcp:
     #[tokio::test]
     async fn atomic_yaml_write_detects_conflicts() {
         let path =
-            std::env::temp_dir().join(format!("ssh-gateway-config-{}.yaml", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sshmcp-config-{}.yaml", uuid::Uuid::new_v4()));
         let raw = "profiles:\n  - name: test\n    target: {host: example, user: root, auth: {type: password, password: secret}}\n";
         tokio::fs::write(&path, raw).await.unwrap();
         let mut config = parse_config(raw, &path).unwrap();
@@ -1989,5 +2024,51 @@ mcp:
             Err(ArrtError::ConfigConflict(_))
         ));
         let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+#[cfg(test)]
+mod migration_env_tests {
+    use super::env_value_with_legacy;
+    #[test]
+    fn new_env_names_take_precedence_and_legacy_names_fall_back() {
+        let lookup = |name: &str| match name {
+            "SSHMCP_MCP_TOKEN" => Some("new".to_string()),
+            "SSH_GATEWAY_MCP_TOKEN" => Some("old".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            env_value_with_legacy("SSHMCP_MCP_TOKEN", lookup).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            env_value_with_legacy("SSH_GATEWAY_MCP_TOKEN", |name| {
+                if name == "SSH_GATEWAY_MCP_TOKEN" {
+                    Some("old".into())
+                } else {
+                    None
+                }
+            })
+            .as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            env_value_with_legacy("SSHMCP_CONFIG_PATH", |name| if name == "ARRT_CONFIG_PATH" {
+                Some("legacy".into())
+            } else {
+                None
+            })
+            .as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            env_value_with_legacy("SSHMCP_TASK_ID", |name| if name == "SSH_GATEWAY_TASK_ID" {
+                Some("task".into())
+            } else {
+                None
+            })
+            .as_deref(),
+            Some("task")
+        );
     }
 }

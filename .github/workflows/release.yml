@@ -21,11 +21,11 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: ssh-gateway
+            binary: sshmcp
             archive_ext: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: ssh-gateway.exe
+            binary: sshmcp.exe
             archive_ext: zip
 
     steps:
@@ -51,7 +51,7 @@ jobs:
       - name: Prepare package variables
         shell: bash
         run: |
-          PACKAGE="ssh-gateway-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          PACKAGE="sshmcp-${GITHUB_REF_NAME}-${{ matrix.target }}"
           echo "PACKAGE=${PACKAGE}" >> "$GITHUB_ENV"
           echo "BIN_PATH=target/${{ matrix.target }}/release/${{ matrix.binary }}" >> "$GITHUB_ENV"
 

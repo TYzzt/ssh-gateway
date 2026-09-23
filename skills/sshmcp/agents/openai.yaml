@@ -1,0 +1,4 @@
+interface:
+  display_name: "SSHMCP"
+  short_description: "Operate remote Linux hosts through local sshmcp profiles"
+  default_prompt: "Use $sshmcp to perform profile-driven remote operations through the local sshmcp CLI."

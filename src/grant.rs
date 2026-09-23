@@ -650,8 +650,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     fn setup() -> (AppConfig, PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("ssh-gateway-grant-{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("sshmcp-grant-{}.db", uuid::Uuid::new_v4()));
         let mut config: AppConfig = serde_yaml::from_str("profiles: []").unwrap();
         config.approval.storage = ApprovalStorageConfig {
             kind: "sqlite".into(),

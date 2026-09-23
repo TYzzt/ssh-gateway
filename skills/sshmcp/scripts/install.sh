@@ -3,11 +3,11 @@ set -euo pipefail
 
 VERSION="${1:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-REPO="TYzzt/ssh-gateway"
-BINARY_NAME="ssh-gateway"
+REPO="sshmcp/sshmcp"
+BINARY_NAME="sshmcp"
 
 if [[ "${OSTYPE:-}" == darwin* ]]; then
-  echo "ssh-gateway does not currently publish macOS release assets." >&2
+  echo "sshmcp does not currently publish macOS release assets." >&2
   exit 1
 fi
 
@@ -23,7 +23,7 @@ require_cmd tar
 
 api_headers=(
   -H "Accept: application/vnd.github+json"
-  -H "User-Agent: ssh-gateway-skill-installer"
+  -H "User-Agent: sshmcp-skill-installer"
 )
 
 if [[ "$VERSION" == "latest" ]]; then
@@ -40,7 +40,7 @@ if [[ -z "${version_tag:-}" ]]; then
   exit 1
 fi
 
-asset_name="ssh-gateway-${version_tag}-x86_64-unknown-linux-gnu.tar.gz"
+asset_name="sshmcp-${version_tag}-x86_64-unknown-linux-gnu.tar.gz"
 asset_url="$(printf '%s' "$release_json" | tr '\n' ' ' | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\\([^\"]*${asset_name//./\\.}\\)\".*/\\1/p")"
 
 if [[ -z "${asset_url:-}" ]]; then
@@ -85,6 +85,6 @@ printf '  "on_path": %s' "$on_path"
 if [[ "$on_path" == "true" ]]; then
   printf '\n'
 else
-  printf ',\n  "add_to_path_hint": "Add %s to PATH if you want to invoke ssh-gateway without an absolute path."\n' "$INSTALL_DIR"
+  printf ',\n  "add_to_path_hint": "Add %s to PATH if you want to invoke sshmcp without an absolute path."\n' "$INSTALL_DIR"
 fi
 printf '}\n'

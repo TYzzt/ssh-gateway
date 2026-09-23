@@ -858,7 +858,7 @@ async fn atomic_write(dst: &Path, content: &[u8]) -> Result<(), ArrtError> {
         ))
     })?;
     let temp = parent.join(format!(
-        ".{}.ssh-gateway-{}.tmp",
+        ".{}.sshmcp-{}.tmp",
         file_name.to_string_lossy(),
         uuid::Uuid::new_v4()
     ));
@@ -1040,7 +1040,7 @@ mod local_path_tests {
 
     #[tokio::test]
     async fn atomic_write_overwrites_complete_file_and_creates_parents() {
-        let root = std::env::temp_dir().join(format!("ssh-gateway-test-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("sshmcp-test-{}", uuid::Uuid::new_v4()));
         let dst = root.join("nested").join("download.txt");
         fs::create_dir_all(dst.parent().unwrap()).await.unwrap();
         fs::write(&dst, b"old content").await.unwrap();

@@ -505,7 +505,7 @@ mod tests {
 
     fn service(ttl: u64) -> (ApprovalService, PathBuf) {
         let path =
-            std::env::temp_dir().join(format!("ssh-gateway-approval-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("sshmcp-approval-{}.db", uuid::Uuid::new_v4()));
         let config: AppConfig = serde_yaml::from_str("profiles: []").unwrap();
         let mut config = config;
         config.approval = ApprovalConfig {

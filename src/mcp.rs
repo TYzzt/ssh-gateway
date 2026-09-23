@@ -156,7 +156,7 @@ pub async fn serve_with_service(
         .task_id_env
         .as_deref()
         .map(|name| {
-            std::env::var(name)
+            crate::config::env_with_legacy(name)
                 .map_err(|_| ArrtError::Config(format!("MCP task_id_env {name} is not set")))
                 .and_then(|value| {
                     if value.trim().is_empty() {
@@ -179,7 +179,7 @@ pub async fn serve_with_service(
     };
     let app = app(state.clone());
     let listener = tokio::net::TcpListener::bind(address).await?;
-    eprintln!("ssh-gateway MCP listening on http://{address}/mcp");
+    eprintln!("sshmcp MCP listening on http://{address}/mcp");
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -229,7 +229,7 @@ async fn oauth_protected_resource(State(state): State<McpState>) -> Response {
         "authorization_servers": [oauth.issuer.as_ref()],
         "scopes_supported": oauth.required_scopes.as_ref(),
         "bearer_methods_supported": ["header"],
-        "resource_documentation": "https://github.com/TYzzt/ssh-gateway"
+        "resource_documentation": "https://github.com/sshmcp/sshmcp"
     }))
     .into_response()
 }
@@ -308,7 +308,7 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
 
 async fn build_auth_state(config: &AppConfig) -> Result<McpAuthState, ArrtError> {
     if config.mcp.auth.kind.eq_ignore_ascii_case("bearer") {
-        let token = std::env::var(&config.mcp.auth.token_env).map_err(|_| {
+        let token = crate::config::env_with_legacy(&config.mcp.auth.token_env).map_err(|_| {
             ArrtError::Config(format!(
                 "MCP bearer token environment variable {} is not set",
                 config.mcp.auth.token_env
@@ -416,7 +416,7 @@ fn canonical_local_file_root(root: Option<&str>) -> Result<Option<Arc<PathBuf>>,
 
 fn task_id_from_env(name: Option<&str>) -> Result<Option<Arc<str>>, ArrtError> {
     name.map(|name| {
-        std::env::var(name)
+        crate::config::env_with_legacy(name)
             .map_err(|_| ArrtError::Config(format!("MCP task_id_env {name} is not set")))
             .and_then(|value| {
                 if value.trim().is_empty() {
@@ -752,7 +752,7 @@ fn initialize_result(payload: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": {"tools": {"listChanged": false}},
-        "serverInfo": {"name":"ssh-gateway", "version":env!("CARGO_PKG_VERSION")},
+        "serverInfo": {"name":"sshmcp", "version":env!("CARGO_PKG_VERSION")},
         "instructions":"Use named profiles. All operations are restricted by each profile's agent_policy."
     })
 }
@@ -1408,7 +1408,7 @@ mod tests {
             resource: "https://resource.example/mcp".into(),
             issuer: "https://issuer.example".into(),
             jwks_url: "https://issuer.example/jwks".into(),
-            required_scopes: Arc::new(vec!["ssh-gateway".into()]),
+            required_scopes: Arc::new(vec!["sshmcp".into()]),
             audience_claim: "aud".into(),
             tenants: Arc::new(vec![TenantRuntime {
                 resource: "https://resource.example/mcp".into(),
@@ -1453,13 +1453,13 @@ mod tests {
             headers
         };
         let alice = authenticate_oauth(
-            &authenticate_token(sign("alice", "https://resource.example/mcp", "ssh-gateway")),
+            &authenticate_token(sign("alice", "https://resource.example/mcp", "sshmcp")),
             &oauth,
         )
         .await
         .unwrap();
         let bob = authenticate_oauth(
-            &authenticate_token(sign("bob", "https://resource.example/mcp", "ssh-gateway")),
+            &authenticate_token(sign("bob", "https://resource.example/mcp", "sshmcp")),
             &oauth,
         )
         .await
@@ -1472,7 +1472,7 @@ mod tests {
             bob.principal.execution_namespace()
         );
         assert!(authenticate_oauth(
-            &authenticate_token(sign("alice", "https://other.example/mcp", "ssh-gateway")),
+            &authenticate_token(sign("alice", "https://other.example/mcp", "sshmcp")),
             &oauth
         )
         .await
@@ -1573,10 +1573,7 @@ mod tests {
 
     #[test]
     fn oauth_security_schemes_are_added_to_tools() {
-        let tools = tool_definitions(
-            true,
-            Some(json!([{"type":"oauth2","scopes":["ssh-gateway"]}])),
-        );
+        let tools = tool_definitions(true, Some(json!([{"type":"oauth2","scopes":["sshmcp"]}])));
         assert!(tools
             .iter()
             .all(|tool| tool["securitySchemes"][0]["type"] == "oauth2"));
@@ -1592,7 +1589,7 @@ mod tests {
                 "https://b.example.com/mcp".into(),
             ])),
             _exp: 4_102_444_800,
-            scope: Some("ssh-gateway other".into()),
+            scope: Some("sshmcp other".into()),
             scp: None,
             extra: Map::new(),
         };
@@ -1605,7 +1602,7 @@ mod tests {
         );
         assert_eq!(
             claim_scopes(&claims),
-            vec!["ssh-gateway".to_string(), "other".to_string()]
+            vec!["sshmcp".to_string(), "other".to_string()]
         );
     }
 

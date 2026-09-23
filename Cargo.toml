@@ -1,11 +1,11 @@
 [package]
-name = "ssh-gateway"
+name = "sshmcp"
 version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/TYzzt/ssh-gateway"
+repository = "https://github.com/sshmcp/sshmcp"
 readme = "README.md"
-description = "Agent-facing SSH gateway with reusable embedded SSH sessions, bastion support, and profile-managed credentials."
+description = "Secure SSH MCP gateway for AI agents with policy, approval, audit, and reusable SSH sessions."
 
 [dependencies]
 base64 = "0.22"

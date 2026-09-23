@@ -11,7 +11,7 @@ pub fn render_agent_script(version: &str) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
-SSH_GATEWAYD_VERSION='{version}'
+SSHMCPD_VERSION='{version}'
 
 quote_sh() {{
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
@@ -247,7 +247,7 @@ run_write_policy() {{
 
 case "${{1:-}}" in
   version|--version)
-    printf '%s\n' "$SSH_GATEWAYD_VERSION"
+    printf '%s\n' "$SSHMCPD_VERSION"
     ;;
   exec)
     shift
@@ -296,8 +296,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         use std::process::{Command, Stdio};
 
-        let temp =
-            std::env::temp_dir().join(format!("ssh-gateway-policy-{}", uuid::Uuid::new_v4()));
+        let temp = std::env::temp_dir().join(format!("sshmcp-policy-{}", uuid::Uuid::new_v4()));
         let allowed = temp.join("allowed");
         let outside = temp.join("outside");
         fs::create_dir_all(&allowed).unwrap();

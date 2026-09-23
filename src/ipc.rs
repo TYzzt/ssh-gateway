@@ -20,7 +20,7 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[cfg(unix)]
 pub fn endpoint_path() -> Result<PathBuf, ArrtError> {
-    Ok(ensure_runtime_dirs()?.join("ssh-gateway.sock"))
+    Ok(ensure_runtime_dirs()?.join("sshmcp.sock"))
 }
 
 #[cfg(windows)]

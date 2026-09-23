@@ -1233,10 +1233,8 @@ mod tests {
 
     #[tokio::test]
     async fn cloud_profile_deletion_requires_single_use_human_approval() {
-        let dir = std::env::temp_dir().join(format!(
-            "ssh-gateway-cloud-profile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sshmcp-cloud-profile-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("profiles.yaml");
         let db = dir.join("approvals.db");
@@ -1410,8 +1408,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_is_checked_before_any_grant() {
-        let path =
-            std::env::temp_dir().join(format!("ssh-gateway-deny-{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("sshmcp-deny-{}.db", uuid::Uuid::new_v4()));
         let mut config: AppConfig = serde_yaml::from_str(
             r#"profiles:
 - name: test
@@ -1446,10 +1443,8 @@ mod tests {
 
     #[tokio::test]
     async fn grant_is_not_created_when_policy_changes_to_deny() {
-        let path = std::env::temp_dir().join(format!(
-            "ssh-gateway-grant-deny-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sshmcp-grant-deny-{}.db", uuid::Uuid::new_v4()));
         let mut config: AppConfig = serde_yaml::from_str(
             r#"profiles:
 - name: test
@@ -1509,10 +1504,8 @@ mod tests {
 
     #[tokio::test]
     async fn max_uses_only_approval_creates_grant() {
-        let path = std::env::temp_dir().join(format!(
-            "ssh-gateway-grant-max-uses-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sshmcp-grant-max-uses-{}.db", uuid::Uuid::new_v4()));
         let mut config: AppConfig = serde_yaml::from_str(
             r#"profiles:
 - name: test
@@ -1605,10 +1598,8 @@ mod tests {
 
     #[tokio::test]
     async fn profile_management_approval_cannot_create_a_grant() {
-        let path = std::env::temp_dir().join(format!(
-            "ssh-gateway-profile-admin-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("sshmcp-profile-admin-{}.db", uuid::Uuid::new_v4()));
         let mut config: AppConfig = serde_yaml::from_str(
             "profiles:\n- name: test\n  target: {host: example, user: root, auth: {type: password, password: secret}}\nmcp:\n  profile_management: {enabled: true}\n",
         )
