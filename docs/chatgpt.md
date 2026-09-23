@@ -22,7 +22,7 @@ Profile management is disabled by default. To expose `create_profile` and `delet
 sudo chown -R 10001:10001 config
 ```
 
-Restart the MCP service after changing the enablement setting so clients receive the updated tool list. Profile creation and deletion are applied after the MCP client obtains user confirmation; they do not require a second Human CLI approval. YAML comments are not retained after a write.
+Restart the MCP service after changing the enablement setting so clients receive the updated tool list. Self-hosted profile changes apply after MCP client confirmation. Cloud runtime mode requires Human CLI approval through the gateway's SQLite approval flow. YAML comments are not retained after a write.
 
 The process explicitly binds all interfaces inside its network-isolated container, while the published host port remains loopback-only. Publish HTTPS through Cloudflare Tunnel, Tailscale, Caddy, or Nginx; `ssh-gateway` intentionally does not terminate public TLS. Do not bake the token or SSH credentials into the image.
 
@@ -60,6 +60,7 @@ mcp:
   tenants:
     - resource: https://gateway.example.com
       config_path: tenants/main/profiles.yaml
+      tenant_id: main
       local_file_root: /srv/ssh-gateway/main/files
       profile_management:
         enabled: false
@@ -73,11 +74,11 @@ Expose `/mcp` through an authenticated HTTPS route. In ChatGPT workspace setting
 
 Available tools: `list_hosts`, `get_profile_policy`, `exec`, `read_file`, `write_file`, `upload_file`, `download_file`, `list_sessions`, `close_session`, and `propose_plan`. When profile management is enabled, `create_profile` and `delete_profile` are also exposed. MCP always applies Agent Policy. `read_file` paginates by byte offset and caps one response at 256 KiB.
 
-`get_profile_policy` accepts an optional profile name and returns complete Agent Policy without SSH credentials. `create_profile` is create-only and rejects duplicate names. `delete_profile` refuses the last profile, referenced profiles, and profiles with active sessions. Profile mutations cannot be converted into grants or plans.
+`get_profile_policy` accepts an optional profile name and returns complete Agent Policy without SSH credentials. `create_profile` is create-only and rejects duplicate names. `delete_profile` refuses the last profile, referenced profiles, and profiles with active sessions. In self-hosted mode, profile mutations use client confirmation. In Cloud runtime mode, they require a single-use Human CLI approval. Profile mutations cannot be converted into grants or plans.
 
 ## Security model
 
-Agents see `PublicProfileInfo`, never serialized credential-bearing profiles. Audit records go to stderr/service logs and include request ID, caller, operation, profile, duration, result, and optionally a redacted command. Keep MCP on loopback behind a private tunnel or reverse proxy; rotate the bearer token if service logs or environment access may have been compromised.
+Agents see `PublicProfile`, never serialized credential-bearing profiles. Audit records go to stderr/service logs and include request ID, caller, operation, profile, duration, result, and optionally a redacted command. Keep MCP on loopback behind a private tunnel or reverse proxy; rotate the bearer token if service logs or environment access may have been compromised.
 
 Profile credentials are written only to the gateway-owned YAML configuration. MCP responses, errors, and audit logs expose only explicitly credential-redacted details.
 

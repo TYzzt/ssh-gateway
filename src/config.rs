@@ -1,4 +1,6 @@
 use crate::errors::ArrtError;
+use crate::storage::{CredentialStore, FileCredentialStore};
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,10 +21,15 @@ pub struct AppConfig {
     pub mcp: McpConfig,
     #[serde(default)]
     pub approval: ApprovalConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     #[serde(skip)]
     source_path: PathBuf,
     #[serde(skip)]
     source_hash: String,
+    /// Internal authorization partition for agent/MCP execution. Never read from YAML.
+    #[serde(skip)]
+    pub authorization_namespace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -222,6 +229,8 @@ pub struct McpAuthConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct McpTenantConfig {
     pub resource: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     pub config_path: String,
     #[serde(default)]
     pub local_file_root: Option<String>,
@@ -239,6 +248,33 @@ pub struct HostEndpoint {
     pub port: u16,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    /// OpenSSH-style SHA256 fingerprint of this hop's server key.
+    #[serde(default)]
+    pub host_key_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    #[default]
+    SelfHosted,
+    Cloud,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKeyMode {
+    Strict,
+    #[default]
+    InsecureCompatibility,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RuntimeConfig {
+    #[serde(default)]
+    pub mode: RuntimeMode,
+    #[serde(default)]
+    pub host_key_mode: HostKeyMode,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -251,6 +287,8 @@ pub struct AuthConfig {
     pub passphrase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +296,7 @@ pub struct AuthConfig {
 pub enum AuthKind {
     Key,
     Password,
+    External,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -307,6 +346,8 @@ pub struct ResolvedProfile {
     pub agent: AgentConfig,
     pub timeouts: TimeoutConfig,
     pub keepalive: KeepaliveConfig,
+    pub host_key_mode: HostKeyMode,
+    pub runtime_mode: RuntimeMode,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +368,7 @@ pub struct ResolvedEndpoint {
     pub user: String,
     pub port: u16,
     pub auth: ResolvedAuthConfig,
+    pub host_key_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -589,11 +631,25 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ArrtError> {
+        self.validate_with_credentials(&FileCredentialStore)
+    }
+
+    pub fn validate_with_credentials(
+        &self,
+        credentials: &dyn CredentialStore,
+    ) -> Result<(), ArrtError> {
         let mut names = HashSet::new();
         if self.profiles.is_empty() && self.mcp.tenants.is_empty() {
             return Err(ArrtError::Config("no profiles configured".to_string()));
         }
         self.validate_mcp()?;
+        if self.runtime.mode == RuntimeMode::Cloud
+            && self.runtime.host_key_mode != HostKeyMode::Strict
+        {
+            return Err(ArrtError::Config(
+                "Cloud runtime requires runtime.host_key_mode: strict".into(),
+            ));
+        }
         for profile in &self.profiles {
             if !names.insert(profile.name.clone()) {
                 return Err(ArrtError::Config(format!(
@@ -604,7 +660,7 @@ impl AppConfig {
         }
         for profile in &self.profiles {
             let mut stack = Vec::new();
-            let _ = self.resolve_profile(&profile.name, &mut stack)?;
+            let _ = self.resolve_profile_with(&profile.name, &mut stack, credentials)?;
         }
         if self.approval.ttl_seconds == 0 {
             return Err(ArrtError::Config(
@@ -660,6 +716,15 @@ impl AppConfig {
             if tenant.config_path.trim().is_empty() {
                 return Err(ArrtError::Config(
                     "mcp.tenants[].config_path must not be empty".into(),
+                ));
+            }
+            if tenant
+                .tenant_id
+                .as_deref()
+                .is_some_and(|id| id.trim().is_empty())
+            {
+                return Err(ArrtError::Config(
+                    "mcp.tenants[].tenant_id must not be empty".into(),
                 ));
             }
             if !resources.insert(tenant.resource.clone()) {
@@ -789,18 +854,35 @@ impl AppConfig {
 
     pub fn resolved_profile(&self, name: &str) -> Result<ResolvedProfile, ArrtError> {
         let mut stack = Vec::new();
-        self.resolve_profile(name, &mut stack)
+        self.resolve_profile_with(name, &mut stack, &FileCredentialStore)
     }
 
+    pub fn resolved_profile_with_credentials(
+        &self,
+        name: &str,
+        credentials: &dyn CredentialStore,
+    ) -> Result<ResolvedProfile, ArrtError> {
+        self.resolve_profile_with(name, &mut Vec::new(), credentials)
+    }
+
+    #[cfg(test)]
     pub fn profile_summary(&self, name: &str) -> Result<Value, ArrtError> {
-        let mut stack = Vec::new();
-        self.profile_summary_with_stack(name, &mut stack)
+        self.profile_summary_with_credentials(name, &FileCredentialStore)
     }
 
-    fn resolve_profile(
+    pub fn profile_summary_with_credentials(
+        &self,
+        name: &str,
+        credentials: &dyn CredentialStore,
+    ) -> Result<Value, ArrtError> {
+        self.profile_summary_with_stack(name, &mut Vec::new(), credentials)
+    }
+
+    fn resolve_profile_with(
         &self,
         name: &str,
         stack: &mut Vec<String>,
+        credentials: &dyn CredentialStore,
     ) -> Result<ResolvedProfile, ArrtError> {
         if stack.iter().any(|item| item == name) {
             let mut cycle = stack.clone();
@@ -812,7 +894,7 @@ impl AppConfig {
         }
         stack.push(name.to_string());
         let profile = self.profile(name)?;
-        let result = profile.resolve(self, self.config_base_dir(), stack);
+        let result = profile.resolve(self, self.config_base_dir(), stack, credentials);
         let _ = stack.pop();
         result
     }
@@ -821,6 +903,7 @@ impl AppConfig {
         &self,
         name: &str,
         stack: &mut Vec<String>,
+        credentials: &dyn CredentialStore,
     ) -> Result<Value, ArrtError> {
         if stack.iter().any(|item| item == name) {
             let mut cycle = stack.clone();
@@ -832,7 +915,7 @@ impl AppConfig {
         }
         stack.push(name.to_string());
         let profile = self.profile(name)?;
-        let result = profile.sanitized_json(self, self.config_base_dir(), stack);
+        let result = profile.sanitized_json(self, self.config_base_dir(), stack, credentials);
         let _ = stack.pop();
         result
     }
@@ -852,6 +935,7 @@ impl Profile {
         config: &AppConfig,
         base_dir: &Path,
         stack: &mut Vec<String>,
+        credentials: &dyn CredentialStore,
     ) -> Result<ResolvedProfile, ArrtError> {
         self.validate_common()?;
 
@@ -869,7 +953,7 @@ impl Profile {
                 )));
             }
 
-            let _ = config.resolve_profile(via_profile, stack)?;
+            let _ = config.resolve_profile_with(via_profile, stack, credentials)?;
             ResolvedTransport::Delegated {
                 via_profile: via_profile.clone(),
                 target: self
@@ -881,12 +965,14 @@ impl Profile {
                 self.auth.as_ref(),
                 base_dir,
                 &format!("profile {} target", self.name),
+                credentials,
             )?;
             for (index, bastion) in self.bastions.iter().enumerate() {
                 bastion.validate(
                     self.auth.as_ref(),
                     base_dir,
                     &format!("profile {} bastion {}", self.name, index + 1),
+                    credentials,
                 )?;
             }
             ResolvedTransport::Direct {
@@ -894,6 +980,7 @@ impl Profile {
                     self.auth.as_ref(),
                     base_dir,
                     &format!("profile {} target", self.name),
+                    credentials,
                 )?,
                 bastions: self
                     .bastions
@@ -904,6 +991,7 @@ impl Profile {
                             self.auth.as_ref(),
                             base_dir,
                             &format!("profile {} bastion {}", self.name, index + 1),
+                            credentials,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -916,6 +1004,8 @@ impl Profile {
             agent: self.agent.clone(),
             timeouts: self.timeouts.clone(),
             keepalive: self.keepalive.clone(),
+            host_key_mode: config.runtime.host_key_mode,
+            runtime_mode: config.runtime.mode,
         })
     }
 
@@ -924,6 +1014,7 @@ impl Profile {
         config: &AppConfig,
         base_dir: &Path,
         stack: &mut Vec<String>,
+        credentials: &dyn CredentialStore,
     ) -> Result<Value, ArrtError> {
         let target = if self.via_profile.is_some() {
             self.target.sanitized_without_auth()?
@@ -936,7 +1027,7 @@ impl Profile {
         };
 
         let via_profile = if let Some(via_profile) = &self.via_profile {
-            let _ = config.resolve_profile(via_profile, stack)?;
+            let _ = config.resolve_profile_with(via_profile, stack, credentials)?;
             json!(via_profile)
         } else {
             Value::Null
@@ -1050,6 +1141,7 @@ impl HostEndpoint {
         fallback_auth: Option<&AuthConfig>,
         base_dir: &Path,
         label: &str,
+        credentials: &dyn CredentialStore,
     ) -> Result<(), ArrtError> {
         if self.host.trim().is_empty() {
             return Err(ArrtError::Config(format!("{label} host is empty")));
@@ -1057,12 +1149,22 @@ impl HostEndpoint {
         if self.user.trim().is_empty() {
             return Err(ArrtError::Config(format!("{label} user is empty")));
         }
+        if let Some(pin) = &self.host_key_sha256 {
+            let bytes = pin
+                .strip_prefix("SHA256:")
+                .and_then(|encoded| STANDARD_NO_PAD.decode(encoded).ok());
+            if bytes.is_none_or(|bytes| bytes.len() != 32) {
+                return Err(ArrtError::Config(format!(
+                    "{label} host_key_sha256 must be an OpenSSH SHA256 fingerprint"
+                )));
+            }
+        }
         let auth = self
             .auth
             .as_ref()
             .or(fallback_auth)
             .ok_or_else(|| ArrtError::Config(format!("{label} auth is missing")))?;
-        let _ = auth.resolve(base_dir, label)?;
+        let _ = credentials.resolve(auth, base_dir, label)?;
         Ok(())
     }
 
@@ -1071,8 +1173,9 @@ impl HostEndpoint {
         fallback_auth: Option<&AuthConfig>,
         base_dir: &Path,
         label: &str,
+        credentials: &dyn CredentialStore,
     ) -> Result<ResolvedEndpoint, ArrtError> {
-        self.validate(fallback_auth, base_dir, label)?;
+        self.validate(fallback_auth, base_dir, label, credentials)?;
         let auth = self
             .auth
             .as_ref()
@@ -1082,7 +1185,8 @@ impl HostEndpoint {
             host: self.host.clone(),
             user: self.user.clone(),
             port: self.port,
-            auth: auth.resolve(base_dir, label)?,
+            auth: credentials.resolve(auth, base_dir, label)?,
+            host_key_sha256: self.host_key_sha256.clone(),
         })
     }
 
@@ -1136,9 +1240,18 @@ impl HostEndpoint {
 }
 
 impl AuthConfig {
-    fn resolve(&self, base_dir: &Path, label: &str) -> Result<ResolvedAuthConfig, ArrtError> {
+    pub(crate) fn resolve(
+        &self,
+        base_dir: &Path,
+        label: &str,
+    ) -> Result<ResolvedAuthConfig, ArrtError> {
         match self.infer_kind(label)? {
             AuthKind::Key => {
+                if self.credential_id.is_some() {
+                    return Err(ArrtError::Config(format!(
+                        "{label} cannot combine credential_id with key_path"
+                    )));
+                }
                 let key_path = self
                     .key_path
                     .as_deref()
@@ -1154,6 +1267,11 @@ impl AuthConfig {
                 })
             }
             AuthKind::Password => {
+                if self.credential_id.is_some() {
+                    return Err(ArrtError::Config(format!(
+                        "{label} cannot combine credential_id with password"
+                    )));
+                }
                 let password = self
                     .password
                     .clone()
@@ -1170,38 +1288,67 @@ impl AuthConfig {
                 }
                 Ok(ResolvedAuthConfig::Password { password })
             }
+            AuthKind::External => Err(ArrtError::Config(format!(
+                "{label} credential_id requires an external CredentialStore"
+            ))),
         }
     }
 
     fn infer_kind(&self, label: &str) -> Result<AuthKind, ArrtError> {
+        if self
+            .credential_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(ArrtError::Config(format!(
+                "{label} credential_id must not be empty"
+            )));
+        }
+        if self.kind == Some(AuthKind::External)
+            && (self.credential_id.is_none()
+                || self.key_path.is_some()
+                || self.passphrase.is_some()
+                || self.password.is_some())
+        {
+            return Err(ArrtError::Config(format!(
+                "{label} external auth requires only credential_id"
+            )));
+        }
         match self.kind {
             Some(kind) => Ok(kind),
             None => match (
                 self.key_path.is_some() || self.passphrase.is_some(),
                 self.password.is_some(),
+                self.credential_id.is_some(),
             ) {
-                (true, false) => Ok(AuthKind::Key),
-                (false, true) => Ok(AuthKind::Password),
-                (false, false) => Err(ArrtError::Config(format!(
+                (true, false, false) => Ok(AuthKind::Key),
+                (false, true, false) => Ok(AuthKind::Password),
+                (false, false, true) => Ok(AuthKind::External),
+                (false, false, false) => Err(ArrtError::Config(format!(
                     "{label} auth is missing type and credentials"
                 ))),
-                (true, true) => Err(ArrtError::Config(format!(
+                (true, true, false) => Err(ArrtError::Config(format!(
                     "{label} auth must not set both key credentials and password"
+                ))),
+                _ => Err(ArrtError::Config(format!(
+                    "{label} auth must specify exactly one credential source"
                 ))),
             },
         }
     }
 
     fn summary(&self, base_dir: &Path, label: &str) -> Result<Value, ArrtError> {
+        if self.infer_kind(label)? == AuthKind::External {
+            return Ok(json!({"type":"external","has_password":false,"has_passphrase":false}));
+        }
         Ok(match self.resolve(base_dir, label)? {
             ResolvedAuthConfig::Key {
-                key_path,
+                key_path: _,
                 passphrase,
             } => json!({
                 "type": AuthKind::Key.as_str(),
                 "has_password": false,
                 "has_passphrase": passphrase.is_some(),
-                "key_path": key_path.display().to_string(),
             }),
             ResolvedAuthConfig::Password { .. } => json!({
                 "type": AuthKind::Password.as_str(),
@@ -1217,6 +1364,7 @@ impl AuthKind {
         match self {
             Self::Key => "key",
             Self::Password => "password",
+            Self::External => "external",
         }
     }
 }
@@ -1334,6 +1482,43 @@ fn parse_config(raw: &str, path: &Path) -> Result<AppConfig, ArrtError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_credential_reference_uses_injected_store() {
+        struct MockCredentials;
+        impl CredentialStore for MockCredentials {
+            fn resolve(
+                &self,
+                auth: &AuthConfig,
+                _base_dir: &Path,
+                _label: &str,
+            ) -> Result<ResolvedAuthConfig, ArrtError> {
+                assert_eq!(auth.credential_id.as_deref(), Some("credential-1"));
+                Ok(ResolvedAuthConfig::Password {
+                    password: "provider-secret".into(),
+                })
+            }
+        }
+        let config: AppConfig = serde_yaml::from_str("profiles:\n  - name: remote\n    target:\n      host: example.com\n      user: root\n      auth:\n        type: external\n        credential_id: credential-1\n").unwrap();
+        assert!(config.validate().is_err());
+        config.validate_with_credentials(&MockCredentials).unwrap();
+        let resolved = config
+            .resolved_profile_with_credentials("remote", &MockCredentials)
+            .unwrap();
+        assert!(matches!(
+            resolved.transport,
+            ResolvedTransport::Direct {
+                target: ResolvedEndpoint {
+                    auth: ResolvedAuthConfig::Password { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        let summary = config.profile_summary("remote").unwrap();
+        assert_eq!(summary["target"]["auth"]["type"], "external");
+        assert!(!summary.to_string().contains("provider-secret"));
+    }
     fn set_base_dir(config: &mut AppConfig) {
         config.source_path = PathBuf::from("C:/config/profiles.yaml");
     }

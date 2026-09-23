@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, McpTenantConfig, Profile};
 use crate::errors::ArrtError;
+use crate::principal::Principal;
 use crate::protocol::{CallerType, Request, WriteMode};
 use crate::service::GatewayService;
 use axum::extract::State;
@@ -52,6 +53,7 @@ struct OAuthState {
 #[derive(Clone)]
 struct TenantRuntime {
     resource: Arc<str>,
+    tenant_id: Arc<str>,
     config_path: Arc<PathBuf>,
     local_file_root: Option<Arc<PathBuf>>,
     task_id: Option<Arc<str>>,
@@ -79,8 +81,7 @@ struct Jwk {
 #[derive(Deserialize)]
 struct JwtClaims {
     iss: String,
-    #[serde(default, rename = "sub")]
-    _sub: Option<String>,
+    sub: Option<String>,
     aud: Option<Audience>,
     #[serde(rename = "exp")]
     _exp: usize,
@@ -106,6 +107,7 @@ enum ScopeClaim {
 
 struct AuthContext {
     tenant: Option<TenantRuntime>,
+    principal: Principal,
 }
 
 #[derive(Deserialize)]
@@ -341,6 +343,7 @@ async fn build_oauth_state(config: &AppConfig) -> Result<OAuthState, ArrtError> 
     let tenants = if config.mcp.tenants.is_empty() {
         vec![TenantRuntime {
             resource: Arc::from(resource),
+            tenant_id: Arc::from(resource),
             config_path: Arc::new(config.source_path().to_path_buf()),
             local_file_root: canonical_local_file_root(config.mcp.local_file_root.as_deref())?,
             task_id: task_id_from_env(config.mcp.task_id_env.as_deref())?,
@@ -382,6 +385,7 @@ fn tenant_runtime(root_path: &Path, tenant: &McpTenantConfig) -> Result<TenantRu
     };
     Ok(TenantRuntime {
         resource: Arc::from(tenant.resource.as_str()),
+        tenant_id: Arc::from(tenant.tenant_id.as_deref().unwrap_or(&tenant.resource)),
         config_path: Arc::new(config_path),
         local_file_root: canonical_local_file_root(tenant.local_file_root.as_deref())?,
         task_id: task_id_from_env(tenant.task_id_env.as_deref())?,
@@ -452,7 +456,10 @@ async fn authenticate(headers: &HeaderMap, state: &McpState) -> Result<AuthConte
     match state.auth.as_ref() {
         McpAuthState::Bearer { token } => {
             if authorized(headers, token) {
-                Ok(AuthContext { tenant: None })
+                Ok(AuthContext {
+                    tenant: None,
+                    principal: Principal::local(CallerType::Mcp),
+                })
             } else {
                 Err(AuthChallenge::bearer())
             }
@@ -495,6 +502,12 @@ async fn authenticate_oauth(
     if claims.iss != oauth.issuer.as_ref() {
         return Err(oauth_challenge(oauth, Some("invalid_token")));
     }
+    let subject = claims
+        .sub
+        .as_deref()
+        .filter(|subject| !subject.trim().is_empty())
+        .ok_or_else(|| oauth_challenge(oauth, Some("invalid_token")))?
+        .to_string();
     let audiences = claim_audiences(&claims, oauth.audience_claim.as_ref());
     let scopes = claim_scopes(&claims);
     if !oauth
@@ -515,6 +528,18 @@ async fn authenticate_oauth(
         .cloned()
         .ok_or_else(|| oauth_challenge(oauth, Some("invalid_token")))?;
     Ok(AuthContext {
+        principal: Principal {
+            caller_type: CallerType::Mcp,
+            subject: Some(subject),
+            tenant_id: Some(tenant.tenant_id.to_string()),
+            resource: Some(tenant.resource.to_string()),
+            client_id: claims
+                .extra
+                .get("client_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            scopes,
+        },
         tenant: Some(tenant),
     })
 }
@@ -598,6 +623,7 @@ fn claim_scopes(claims: &JwtClaims) -> Vec<String> {
     }
 }
 
+#[derive(Debug)]
 struct AuthChallenge {
     header: String,
 }
@@ -757,18 +783,12 @@ async fn call_tool(
     args: Value,
 ) -> Result<Value, String> {
     if name == "list_hosts" {
-        return match load_tenant_config(auth).await? {
-            Some(config) => service
-                .list_hosts_for_config(request_id, CallerType::Mcp, &config)
-                .await
-                .map(|hosts| json!({"hosts": hosts}))
-                .map_err(|err| err.to_string()),
-            None => service
-                .list_hosts(request_id, CallerType::Mcp)
-                .await
-                .map(|hosts| json!({"hosts": hosts}))
-                .map_err(|err| err.to_string()),
-        };
+        let config = load_tenant_config(auth).await?;
+        return service
+            .list_hosts_for_principal(request_id, &auth.principal, config.as_ref())
+            .await
+            .map(|hosts| json!({"hosts": hosts}))
+            .map_err(|err| err.to_string());
     }
     if args.get("task_id").is_some() {
         return Err(
@@ -786,9 +806,9 @@ async fn call_tool(
     let result = match load_tenant_config(auth).await? {
         Some(config) => {
             service
-                .execute_for_config(
+                .execute_for_principal_config(
                     request_id,
-                    CallerType::Mcp,
+                    auth.principal.clone(),
                     task_id.map(str::to_string),
                     request,
                     config,
@@ -798,9 +818,9 @@ async fn call_tool(
         }
         None => {
             service
-                .execute(
+                .execute_principal(
                     request_id,
-                    CallerType::Mcp,
+                    auth.principal.clone(),
                     task_id.map(str::to_string),
                     request,
                 )
@@ -851,7 +871,7 @@ fn local_file_root<'a>(state: &'a McpState, auth: &'a AuthContext) -> Option<&'a
     auth.tenant
         .as_ref()
         .and_then(|tenant| tenant.local_file_root.as_deref())
-        .or_else(|| state.local_file_root.as_deref())
+        .or(state.local_file_root.as_deref())
         .map(PathBuf::as_path)
 }
 
@@ -862,7 +882,7 @@ fn task_id<'a>(state: &'a McpState, auth: &'a AuthContext) -> Option<&'a str> {
         .or(state.task_id.as_deref())
 }
 
-fn session_namespace<'a>(auth: &'a AuthContext) -> &'a str {
+fn session_namespace(auth: &AuthContext) -> &str {
     auth.tenant
         .as_ref()
         .map(|tenant| tenant.resource.as_ref())
@@ -1138,12 +1158,26 @@ fn validate_endpoint(value: Option<&Value>, path: &str) -> Result<(), String> {
     let Some(value) = value else {
         return Ok(());
     };
-    reject_keys(value, path, &["host", "user", "port", "auth"])?;
+    reject_keys(
+        value,
+        path,
+        &["host", "user", "port", "auth", "host_key_sha256"],
+    )?;
     validate_auth(value.get("auth"), &format!("{path}.auth"))
 }
 
 fn validate_auth(value: Option<&Value>, path: &str) -> Result<(), String> {
-    reject_optional_keys(value, path, &["type", "key_path", "passphrase", "password"])
+    reject_optional_keys(
+        value,
+        path,
+        &[
+            "type",
+            "key_path",
+            "passphrase",
+            "password",
+            "credential_id",
+        ],
+    )
 }
 
 fn reject_optional_keys(value: Option<&Value>, path: &str, allowed: &[&str]) -> Result<(), String> {
@@ -1299,8 +1333,8 @@ fn tool_definitions(
 }
 
 fn profile_schema() -> Value {
-    let auth = json!({"type":"object","properties":{"type":{"type":"string","enum":["key","password"]},"key_path":{"type":"string"},"passphrase":{"type":"string"},"password":{"type":"string"}},"additionalProperties":false});
-    let endpoint = json!({"type":"object","properties":{"host":{"type":"string"},"user":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"auth":auth},"required":["host","user"],"additionalProperties":false});
+    let auth = json!({"type":"object","properties":{"type":{"type":"string","enum":["key","password","external"]},"key_path":{"type":"string"},"passphrase":{"type":"string"},"password":{"type":"string"},"credential_id":{"type":"string"}},"additionalProperties":false});
+    let endpoint = json!({"type":"object","properties":{"host":{"type":"string"},"user":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"host_key_sha256":{"type":"string"},"auth":auth},"required":["host","user"],"additionalProperties":false});
     let capabilities = json!({"type":"object","properties":{"exec":{"type":"boolean"},"read":{"type":"boolean"},"write":{"type":"boolean"},"upload":{"type":"boolean"},"download":{"type":"boolean"},"tunnel":{"type":"boolean"}},"additionalProperties":false});
     let rule = json!({"type":"object","properties":{"id":{"type":"string"},"match":{"type":"object","properties":{"operation":{"type":"string","enum":["exec","read","write","upload","download"]},"commands":{"type":"array","items":{"type":"string"}},"paths":{"type":"array","items":{"type":"string"}}},"required":["operation"],"additionalProperties":false},"effect":{"type":"string","enum":["allow","confirm","deny"]},"risk":{"type":"string","enum":["low","medium","high","critical"]},"reason":{"type":"string"}},"required":["id","match","effect"],"additionalProperties":false});
     json!({
@@ -1350,7 +1384,106 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use rsa::{pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts, RsaPrivateKey};
+    use serde::Serialize;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn oauth_jwt_authenticates_subject_and_isolates_principals() {
+        #[derive(Serialize)]
+        struct Claims<'a> {
+            iss: &'a str,
+            sub: &'a str,
+            aud: &'a str,
+            exp: usize,
+            scope: &'a str,
+            client_id: &'a str,
+        }
+        let key = RsaPrivateKey::new(&mut rand::rng(), 2048).unwrap();
+        let public = key.to_public_key();
+        let der = key.to_pkcs1_der().unwrap();
+        let oauth = OAuthState {
+            resource: "https://resource.example/mcp".into(),
+            issuer: "https://issuer.example".into(),
+            jwks_url: "https://issuer.example/jwks".into(),
+            required_scopes: Arc::new(vec!["ssh-gateway".into()]),
+            audience_claim: "aud".into(),
+            tenants: Arc::new(vec![TenantRuntime {
+                resource: "https://resource.example/mcp".into(),
+                tenant_id: "tenant-1".into(),
+                config_path: Arc::new(PathBuf::from("/tmp/unused-config")),
+                local_file_root: None,
+                task_id: None,
+                profile_management: None,
+            }]),
+            client: Client::new(),
+            jwks: RwLock::new(Some(JwksCache {
+                keys: vec![Jwk {
+                    kid: Some("test-key".into()),
+                    kty: Some("RSA".into()),
+                    n: Some(URL_SAFE_NO_PAD.encode(public.n_bytes())),
+                    e: Some(URL_SAFE_NO_PAD.encode(public.e_bytes())),
+                }],
+                fetched_at: Instant::now(),
+            })),
+        };
+        let signing_key = EncodingKey::from_rsa_der(der.as_bytes());
+        let sign = |sub: &str, aud: &str, scope: &str| {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some("test-key".into());
+            encode(
+                &header,
+                &Claims {
+                    iss: "https://issuer.example",
+                    sub,
+                    aud,
+                    exp: 4_102_444_800,
+                    scope,
+                    client_id: "codex",
+                },
+                &signing_key,
+            )
+            .unwrap()
+        };
+        let authenticate_token = |token: String| {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            headers
+        };
+        let alice = authenticate_oauth(
+            &authenticate_token(sign("alice", "https://resource.example/mcp", "ssh-gateway")),
+            &oauth,
+        )
+        .await
+        .unwrap();
+        let bob = authenticate_oauth(
+            &authenticate_token(sign("bob", "https://resource.example/mcp", "ssh-gateway")),
+            &oauth,
+        )
+        .await
+        .unwrap();
+        assert_eq!(alice.principal.subject.as_deref(), Some("alice"));
+        assert_eq!(alice.principal.tenant_id.as_deref(), Some("tenant-1"));
+        assert_eq!(alice.principal.client_id.as_deref(), Some("codex"));
+        assert_ne!(
+            alice.principal.execution_namespace(),
+            bob.principal.execution_namespace()
+        );
+        assert!(authenticate_oauth(
+            &authenticate_token(sign("alice", "https://other.example/mcp", "ssh-gateway")),
+            &oauth
+        )
+        .await
+        .is_err());
+        assert!(authenticate_oauth(
+            &authenticate_token(sign("alice", "https://resource.example/mcp", "wrong")),
+            &oauth
+        )
+        .await
+        .is_err());
+    }
 
     #[test]
     fn bearer_auth_is_exact_and_constant_time() {
@@ -1453,7 +1586,7 @@ mod tests {
     fn oauth_claim_helpers_accept_audiences_and_scopes() {
         let claims = JwtClaims {
             iss: "https://idp.example.com".into(),
-            _sub: Some("user".into()),
+            sub: Some("user".into()),
             aud: Some(Audience::Many(vec![
                 "https://a.example.com/mcp".into(),
                 "https://b.example.com/mcp".into(),
@@ -1560,5 +1693,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_http_preserves_bearer_and_both_protocol_versions() {
+        let state = McpState {
+            service: GatewayService::new(),
+            auth: Arc::new(McpAuthState::Bearer {
+                token: "test-token".into(),
+            }),
+            allowed_origins: Arc::new(Vec::new()),
+            local_file_root: None,
+            task_id: None,
+            profile_management_enabled: false,
+        };
+        for version in [MCP_PROTOCOL_CURRENT, MCP_PROTOCOL_COMPAT] {
+            let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":version}}).to_string();
+            let response = app(state.clone())
+                .oneshot(
+                    HttpRequest::post("/mcp")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-token")
+                        .header("mcp-method", "initialize")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["result"]["protocolVersion"], version);
+        }
+        let current_ping = json!({"jsonrpc":"2.0","id":2,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":MCP_PROTOCOL_CURRENT}}}).to_string();
+        let response = app(state.clone())
+            .oneshot(
+                HttpRequest::post("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(current_ping.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"],
+            -32600
+        );
+        let response = app(state)
+            .oneshot(
+                HttpRequest::post("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .header("mcp-method", "ping")
+                    .body(Body::from(current_ping))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["result"],
+            json!({})
+        );
     }
 }

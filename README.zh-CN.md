@@ -36,7 +36,7 @@
 - **在 gateway API 边界做 secret isolation**：daemon 从配置文件读取密码、密钥路径和可选的私钥口令；调用方只传 `profile` 和操作参数。
 - **脱敏的 profile / session 输出**：`profile show`、`session inspect`、错误结果都不会回显原始密码或口令。
 - **面向 agent 的 profile-first 工作流**：agent 用 profile 名称工作，而不是拼带密码的 `ssh` 命令。
-- **用户确认的 profile 管理**：MCP 可查询策略；显式开启后，MCP 客户端取得用户确认即可新增或删除 profile。
+- **受控的 profile 管理**：MCP 可查询策略；显式开启后可请求新增或删除 profile。自托管模式使用 MCP 客户端确认；Cloud 运行模式需要 Human CLI 审批。
 - **嵌入式 SSH + 会话复用**：direct / bastion 模式不依赖本地反复起 `ssh.exe` 或 `scp`。
 - **direct / bastion 模式下本地不依赖 OpenSSH**：Windows 和 Linux 的直连传输都走内置 SSH 客户端栈。
 - **逐跳认证**：target 和每个 bastion 都可以各自配置 password 或 key。
@@ -50,6 +50,14 @@
 Codex 本地接入见 [docs/codex.md](docs/codex.md)，ChatGPT MCP 与 NAS 部署见 [docs/chatgpt.md](docs/chatgpt.md)。
 
 ## 安全模型
+
+### 运行模式与主机密钥
+
+默认的 `self_hosted` 模式兼容现有 YAML。默认的 `runtime.host_key_mode: insecure_compatibility` 会接受未固定的 SSH 主机密钥，这种方式无法防止服务器冒充。建议设置 `runtime.host_key_mode: strict`，并在目标与每个 bastion 的配置中填写经独立渠道核实的 `host_key_sha256: "SHA256:..."`。即使处于兼容模式，已配置的指纹也会被强制检查。
+
+`runtime.mode: cloud` 是面向未来托管环境的核心安全模式，并非现成的云服务。它强制使用严格主机密钥校验，禁止 SSH tunnel，拒绝不安全的目标地址；经 bastion 转发的后续跳点须使用 IP 字面量，`via_profile` 暂不支持。参见[架构](docs/architecture.md)和[安全模型](docs/security-model.md)。
+
+MCP 与 CLI 调用会映射为 `Principal`。OAuth JWT 的 `sub` 标识调用者，`mcp.tenants[].tenant_id` 可单独标识租户；会话和授权记录使用由身份派生的内部命名空间。审计通过可替换的 sink 记录脱敏事件。
 
 <p align="center">
   <img src="docs/readme/security.svg" alt="Security boundary for profile-driven secrets and redacted outputs" width="100%">
@@ -352,14 +360,14 @@ python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github
 
 - 触发条件：推送匹配 `v*` 的 tag
 - 构建矩阵：Windows x64 和 Linux x64
-- 固定步骤：checkout、安装 Rust stable、`cargo test --locked`、`cargo build --release --locked`、打包产物、创建 GitHub Release、上传二进制和 `SHA256SUMS`
+- 固定步骤：checkout、安装 Rust stable、`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --locked`、`cargo build --release --locked`、打包产物、创建 GitHub Release、上传二进制和 `SHA256SUMS`
 - Release Notes：交给 GitHub 自动生成
 
 示例：
 
 ```bash
-git tag v0.1.5
-git push origin v0.1.5
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ## 许可证

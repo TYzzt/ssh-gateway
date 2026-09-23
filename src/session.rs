@@ -1,8 +1,11 @@
 use crate::agent::{expected_version, render_agent_script};
-use crate::config::{AppConfig, DelegatedEndpoint, ResolvedProfile, ResolvedTransport};
+use crate::config::{
+    AppConfig, DelegatedEndpoint, ResolvedProfile, ResolvedTransport, RuntimeMode,
+};
 use crate::errors::ArrtError;
 use crate::protocol::{CommandResult, EnvVar, ErrorPayload, WriteMode};
 use crate::ssh::{self, CommandOutput, EmbeddedSession};
+use crate::storage::{CredentialStore, FileCredentialStore};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
 use std::collections::HashMap;
@@ -29,6 +32,7 @@ pub struct SessionInfo {
     pub agent_path: Option<String>,
     pub agent_version: Option<String>,
     pub last_used: Instant,
+    pub idle_timeout: Duration,
     pub active_operations: usize,
 }
 
@@ -58,16 +62,32 @@ pub struct TunnelInfo {
     pub task: JoinHandle<()>,
 }
 
-#[derive(Default)]
 pub struct SessionManager {
     sessions: HashMap<String, SessionInfo>,
     profile_index: HashMap<(String, String), String>,
     tunnels: HashMap<String, TunnelInfo>,
+    credentials: Arc<dyn CredentialStore>,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::with_credentials(Arc::new(FileCredentialStore))
+    }
 }
 
 impl SessionManager {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_credentials(credentials: Arc<dyn CredentialStore>) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            profile_index: HashMap::new(),
+            tunnels: HashMap::new(),
+            credentials,
+        }
     }
 
     pub fn sessions_json(&self, namespace: &str) -> serde_json::Value {
@@ -79,11 +99,18 @@ impl SessionManager {
             .collect::<Vec<_>>())
     }
 
+    #[cfg(test)]
     pub fn has_profile_session(&self, namespace: &str, profile: &str) -> bool {
         self.sessions.values().any(|session| {
             session.namespace == namespace
                 && (session.profile_name == profile
                     || session.upstream_profile.as_deref() == Some(profile))
+        })
+    }
+
+    pub fn has_any_profile_session(&self, profile: &str) -> bool {
+        self.sessions.values().any(|session| {
+            session.profile_name == profile || session.upstream_profile.as_deref() == Some(profile)
         })
     }
 
@@ -149,9 +176,18 @@ impl SessionManager {
     }
 
     pub async fn reap_idle_sessions(&mut self, config: &AppConfig, namespace: &str) {
+        self.reap_idle_sessions_matching(config, Some(namespace))
+            .await;
+    }
+
+    pub async fn reap_all_idle_sessions(&mut self, config: &AppConfig) {
+        self.reap_idle_sessions_matching(config, None).await;
+    }
+
+    async fn reap_idle_sessions_matching(&mut self, config: &AppConfig, namespace: Option<&str>) {
         let mut expired = Vec::new();
         for (session_id, session) in &self.sessions {
-            if session.namespace != namespace {
+            if namespace.is_some_and(|namespace| session.namespace != namespace) {
                 continue;
             }
             let has_tunnel = self
@@ -161,16 +197,19 @@ impl SessionManager {
             if session.active_operations > 0 || has_tunnel {
                 continue;
             }
-            if let Ok(profile) = config.resolved_profile(&session.profile_name) {
-                if session.last_used.elapsed()
-                    > Duration::from_secs(profile.timeouts.idle_session_seconds)
-                {
-                    expired.push(session_id.clone());
-                }
+            if session.last_used.elapsed() > session.idle_timeout {
+                expired.push(session_id.clone());
             }
         }
         for session_id in expired {
-            let _ = self.close_session(config, namespace, &session_id).await;
+            let Some(namespace) = self
+                .sessions
+                .get(&session_id)
+                .map(|session| session.namespace.clone())
+            else {
+                continue;
+            };
+            let _ = self.close_session(config, &namespace, &session_id).await;
         }
     }
 
@@ -206,7 +245,16 @@ impl SessionManager {
                         via_profile,
                         target,
                     } => {
-                        let upstream = config.resolved_profile(via_profile)?;
+                        if config.runtime.mode == RuntimeMode::Cloud {
+                            return Err(ArrtError::PolicyDenied(
+                            "Cloud target policy cannot verify delegated via_profile destinations"
+                                .into(),
+                        ));
+                        }
+                        let upstream = config.resolved_profile_with_credentials(
+                            via_profile,
+                            self.credentials.as_ref(),
+                        )?;
                         let upstream_session_id =
                             self.ensure_session(config, namespace, &upstream).await?;
                         let upstream_transport = self
@@ -234,6 +282,7 @@ impl SessionManager {
                 agent_path: None,
                 agent_version: None,
                 last_used: Instant::now(),
+                idle_timeout: Duration::from_secs(profile.timeouts.idle_session_seconds),
                 active_operations: 0,
             };
             self.profile_index.insert(profile_key, session_id.clone());
@@ -394,6 +443,7 @@ impl SessionManager {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare_exec(
         &mut self,
         config: &AppConfig,
@@ -404,7 +454,8 @@ impl SessionManager {
         timeout_seconds: Option<u64>,
         env: Vec<EnvVar>,
     ) -> Result<PreparedExec, ArrtError> {
-        let profile = config.resolved_profile(profile_name)?;
+        let profile =
+            config.resolved_profile_with_credentials(profile_name, self.credentials.as_ref())?;
         let session_id = self.ensure_session(config, namespace, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
         let timeout_seconds = timeout_seconds.unwrap_or(profile.timeouts.exec_seconds);
@@ -486,7 +537,8 @@ impl SessionManager {
         path: String,
         allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
-        let profile = config.resolved_profile(profile_name)?;
+        let profile =
+            config.resolved_profile_with_credentials(profile_name, self.credentials.as_ref())?;
         let session_id = self.ensure_session(config, namespace, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
         let mut args = vec![
@@ -513,6 +565,7 @@ impl SessionManager {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn write(
         &mut self,
         config: &AppConfig,
@@ -523,7 +576,8 @@ impl SessionManager {
         content_b64: String,
         allowed_roots: &[String],
     ) -> Result<CommandResult, ArrtError> {
-        let profile = config.resolved_profile(profile_name)?;
+        let profile =
+            config.resolved_profile_with_credentials(profile_name, self.credentials.as_ref())?;
         let session_id = self.ensure_session(config, namespace, &profile).await?;
         self.ensure_agent(&profile, &session_id).await?;
         let content = BASE64
@@ -629,7 +683,8 @@ impl SessionManager {
         remote_host: String,
         remote_port: u16,
     ) -> Result<CommandResult, ArrtError> {
-        let profile = config.resolved_profile(profile_name)?;
+        let profile =
+            config.resolved_profile_with_credentials(profile_name, self.credentials.as_ref())?;
         let session_id = self.ensure_session(config, namespace, &profile).await?;
         let session = self
             .sessions
@@ -890,6 +945,7 @@ mod local_path_tests {
             agent_path: None,
             agent_version: None,
             last_used: Instant::now(),
+            idle_timeout: Duration::from_secs(900),
             active_operations: 0,
         }
     }
@@ -921,6 +977,19 @@ mod local_path_tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_reaps_idle_sessions_in_every_namespace() {
+        let mut manager = SessionManager::new();
+        for namespace in ["tenant-a:user-a", "tenant-b:user-b"] {
+            let mut session = fake_session(namespace, "shared");
+            session.last_used = Instant::now() - Duration::from_secs(2);
+            session.idle_timeout = Duration::from_secs(1);
+            manager.sessions.insert(session.session_id.clone(), session);
+        }
+        manager.reap_all_idle_sessions(&AppConfig::default()).await;
+        assert!(manager.sessions.is_empty());
     }
 
     #[tokio::test]

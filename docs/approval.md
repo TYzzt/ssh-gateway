@@ -43,7 +43,7 @@ ssh-gateway approval approve apr_...
 
 Approval atomically claims the pending row, verifies its SHA-256 request hash, reruns policy and path safety checks, and executes the frozen request once. `approval reject` rejects it; `approval cleanup` removes terminal rows. `ssh-gateway --agent approval ...` is denied, and MCP exposes no approve/reject tools.
 
-Profile creation and deletion are separate from this server-side approval flow. When `mcp.profile_management.enabled` is true, the MCP client obtains user confirmation and the gateway applies the requested mutation directly. The gateway still validates the complete candidate configuration; deletion also rechecks profile dependencies, active sessions, and the profile fingerprint immediately before writing YAML. Profile management cannot create grants or appear in Plans.
+In self-hosted mode, profile creation and deletion use MCP client confirmation when `mcp.profile_management.enabled` is true. In Cloud runtime mode, the gateway creates a single-use approval that only the Human CLI can approve. The gateway validates the complete candidate configuration; deletion also rechecks profile dependencies, active sessions, and the profile fingerprint immediately before writing YAML. Profile management cannot create grants or appear in Plans.
 
 Write approvals bind encoded content. Upload approvals also bind the current local file bytes, so a changed source is rejected. Remote file operations rerun remote real-path enforcement at execution to protect against symlink changes. List/show/MCP expose redacted metadata, never stored payload.
 

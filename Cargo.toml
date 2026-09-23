@@ -1,6 +1,6 @@
 [package]
 name = "ssh-gateway"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/TYzzt/ssh-gateway"
@@ -30,3 +30,5 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+rand = "0.10"
+rsa = "0.10.0-rc.17"

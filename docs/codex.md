@@ -16,6 +16,8 @@ npx skills add TYzzt/ssh-gateway --skill ssh-gateway
 
 Set `ARRT_CONFIG_PATH` to a YAML/TOML profile file, or use the platform default described in the README.
 
+Existing self-hosted profiles remain valid. For verified SSH connections, set `runtime.host_key_mode: strict` and configure a checked `host_key_sha256` fingerprint on the target and every bastion. The default `insecure_compatibility` mode accepts unpinned keys and is vulnerable to SSH server impersonation. See the [security model](security-model.md).
+
 ## Agent workflow
 
 Codex should discover named hosts without asking for credentials:

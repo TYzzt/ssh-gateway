@@ -1,11 +1,19 @@
-use crate::approval::{request_hash, ApprovalService};
-use crate::config::{config_path_display, AppConfig};
+use crate::approval::request_hash;
+#[cfg(test)]
+use crate::approval::ApprovalService;
+use crate::audit::{AuditEvent, AuditSink, AuthorizationAuditEvent, StderrAuditSink};
+use crate::config::{config_path_display, AppConfig, RiskLevelConfig, RuntimeMode};
 use crate::errors::ArrtError;
 use crate::grant::{GrantService, PlanAuthorization};
 use crate::policy::{PolicyEffect, PolicyEngine};
+use crate::principal::Principal;
 use crate::protocol::{CallerType, CommandResult, ErrorPayload, Request};
 use crate::redaction::SecretRedactor;
 use crate::session::{absolute_local_path, SessionManager};
+use crate::storage::{
+    ApprovalStoreFactory, CredentialStore, FileCredentialStore, FileProfileStore, ProfileStore,
+    SqliteApprovalStoreFactory,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,10 +21,11 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
+#[cfg(test)]
 const DEFAULT_SESSION_NAMESPACE: &str = "default";
 
 #[derive(Debug, Serialize)]
-pub struct PublicProfileInfo {
+pub struct PublicProfile {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -27,14 +36,36 @@ pub struct GatewayService {
     sessions: Mutex<SessionManager>,
     config_access: RwLock<()>,
     maintenance_started: AtomicBool,
+    audit_sink: Arc<dyn AuditSink>,
+    profiles: Arc<dyn ProfileStore>,
+    credentials: Arc<dyn CredentialStore>,
+    approvals: Arc<dyn ApprovalStoreFactory>,
 }
 
 impl GatewayService {
     pub fn new() -> Arc<Self> {
+        Self::with_providers(
+            Arc::new(FileProfileStore),
+            Arc::new(FileCredentialStore),
+            Arc::new(SqliteApprovalStoreFactory),
+            Arc::new(StderrAuditSink),
+        )
+    }
+
+    pub fn with_providers(
+        profiles: Arc<dyn ProfileStore>,
+        credentials: Arc<dyn CredentialStore>,
+        approvals: Arc<dyn ApprovalStoreFactory>,
+        audit_sink: Arc<dyn AuditSink>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            sessions: Mutex::new(SessionManager::new()),
+            sessions: Mutex::new(SessionManager::with_credentials(credentials.clone())),
             config_access: RwLock::new(()),
             maintenance_started: AtomicBool::new(false),
+            audit_sink,
+            profiles,
+            credentials,
+            approvals,
         })
     }
 
@@ -51,48 +82,47 @@ impl GatewayService {
                     break;
                 };
                 let _config_guard = service.config_access.read().await;
-                if let Ok(config) = AppConfig::load().await {
+                if let Ok(config) = service.profiles.load().await {
                     service
                         .sessions
                         .lock()
                         .await
-                        .reap_idle_sessions(&config, DEFAULT_SESSION_NAMESPACE)
+                        .reap_all_idle_sessions(&config)
                         .await;
                 }
             }
         });
     }
 
-    pub async fn list_hosts(
+    pub async fn list_hosts_for_principal(
         &self,
         request_id: &str,
-        caller: CallerType,
-    ) -> Result<Vec<PublicProfileInfo>, ArrtError> {
-        let started = Instant::now();
-        let _config_guard = self.config_access.read().await;
-        let config = AppConfig::load().await?;
-        self.list_hosts_with_config(request_id, caller, &config, started)
-            .await
-    }
-
-    pub async fn list_hosts_for_config(
-        &self,
-        request_id: &str,
-        caller: CallerType,
-        config: &AppConfig,
-    ) -> Result<Vec<PublicProfileInfo>, ArrtError> {
-        self.list_hosts_with_config(request_id, caller, config, Instant::now())
-            .await
+        principal: &Principal,
+        config: Option<&AppConfig>,
+    ) -> Result<Vec<PublicProfile>, ArrtError> {
+        match config {
+            Some(config) => {
+                self.list_hosts_with_config(request_id, principal, config, Instant::now())
+                    .await
+            }
+            None => {
+                let _guard = self.config_access.read().await;
+                let config = self.profiles.load().await?;
+                self.list_hosts_with_config(request_id, principal, &config, Instant::now())
+                    .await
+            }
+        }
     }
 
     async fn list_hosts_with_config(
         &self,
         request_id: &str,
-        caller: CallerType,
+        principal: &Principal,
         config: &AppConfig,
         started: Instant,
-    ) -> Result<Vec<PublicProfileInfo>, ArrtError> {
-        let redactor = SecretRedactor::from_config(&config);
+    ) -> Result<Vec<PublicProfile>, ArrtError> {
+        let redactor =
+            SecretRedactor::from_config_with_credentials(config, self.credentials.as_ref());
         let hosts = config
             .profiles
             .iter()
@@ -111,7 +141,7 @@ impl GatewayService {
                         capabilities.push(name);
                     }
                 }
-                PublicProfileInfo {
+                PublicProfile {
                     name: profile.name.clone(),
                     description: profile
                         .description
@@ -122,9 +152,10 @@ impl GatewayService {
             })
             .collect();
         audit(
-            &config,
+            self.audit_sink.as_ref(),
+            config,
             request_id,
-            caller,
+            principal,
             &Request::ProfileList,
             started,
             &CommandResult::success(),
@@ -140,6 +171,18 @@ impl GatewayService {
         task_id: Option<String>,
         request: Request,
     ) -> CommandResult {
+        self.execute_principal(request_id, Principal::local(caller), task_id, request)
+            .await
+    }
+
+    pub async fn execute_principal(
+        &self,
+        request_id: &str,
+        principal: Principal,
+        task_id: Option<String>,
+        request: Request,
+    ) -> CommandResult {
+        let caller = principal.caller_type;
         let started = Instant::now();
         if let Err(err) = prevalidate(&request) {
             return error_result(err, &request);
@@ -168,28 +211,29 @@ impl GatewayService {
         } else {
             Some(self.config_access.read().await)
         };
-        let config = AppConfig::load().await;
+        let config = self.profiles.load().await;
         self.execute_loaded(
             request_id,
-            caller,
+            &principal,
             task_id,
             request,
             started,
             config,
-            DEFAULT_SESSION_NAMESPACE,
+            &principal.execution_namespace(),
         )
         .await
     }
 
-    pub async fn execute_for_config(
+    pub async fn execute_for_principal_config(
         &self,
         request_id: &str,
-        caller: CallerType,
+        principal: Principal,
         task_id: Option<String>,
         request: Request,
         config: AppConfig,
-        session_namespace: &str,
+        _routing_namespace: &str,
     ) -> CommandResult {
+        let caller = principal.caller_type;
         let started = Instant::now();
         if let Err(err) = prevalidate(&request) {
             return error_result(err, &request);
@@ -199,20 +243,21 @@ impl GatewayService {
         }
         self.execute_loaded(
             request_id,
-            caller,
+            &principal,
             task_id,
             request,
             started,
             Ok(config),
-            session_namespace,
+            &principal.execution_namespace(),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_loaded(
         &self,
         request_id: &str,
-        caller: CallerType,
+        principal: &Principal,
         task_id: Option<String>,
         request: Request,
         started: Instant,
@@ -220,24 +265,29 @@ impl GatewayService {
         session_namespace: &str,
     ) -> CommandResult {
         let mut result = match config {
-            Ok(config) => {
+            Ok(mut config) => {
+                if principal.caller_type.enforces_agent_policy() {
+                    config.authorization_namespace = Some(principal.execution_namespace());
+                }
                 let redactor = match &request {
                     Request::ProfileCreate { profile } => {
-                        SecretRedactor::from_config_and_profile(&config, profile)
+                        SecretRedactor::from_config_and_profile_with_credentials(
+                            &config,
+                            profile,
+                            self.credentials.as_ref(),
+                        )
                     }
-                    _ => SecretRedactor::from_config(&config),
+                    _ => SecretRedactor::from_config_with_credentials(
+                        &config,
+                        self.credentials.as_ref(),
+                    ),
                 };
                 let result = if matches!(
                     request,
                     Request::ProfileCreate { .. } | Request::ProfileDelete { .. }
                 ) {
-                    self.execute_mcp_profile_management(
-                        &config,
-                        caller,
-                        request.clone(),
-                        session_namespace,
-                    )
-                    .await
+                    self.execute_mcp_profile_management(&config, principal, request.clone())
+                        .await
                 } else if matches!(
                     request,
                     Request::ApprovalList
@@ -257,7 +307,7 @@ impl GatewayService {
                 ) {
                     self.execute_authorization_admin(
                         &config,
-                        caller,
+                        principal,
                         request.clone(),
                         session_namespace,
                     )
@@ -265,7 +315,7 @@ impl GatewayService {
                 } else {
                     self.resolve_operation(
                         &config,
-                        caller,
+                        principal,
                         task_id.as_deref(),
                         request.clone(),
                         &redactor,
@@ -276,7 +326,14 @@ impl GatewayService {
                 let mut result = result.unwrap_or_else(|err| error_result(err, &request));
                 redact_result(&redactor, &mut result);
                 audit(
-                    &config, request_id, caller, &request, started, &result, &redactor,
+                    self.audit_sink.as_ref(),
+                    &config,
+                    request_id,
+                    principal,
+                    &request,
+                    started,
+                    &result,
+                    &redactor,
                 );
                 result
             }
@@ -291,11 +348,10 @@ impl GatewayService {
     async fn execute_mcp_profile_management(
         &self,
         config: &AppConfig,
-        caller: CallerType,
+        principal: &Principal,
         request: Request,
-        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
-        if caller != CallerType::Mcp {
+        if principal.caller_type != CallerType::Mcp {
             return Err(ArrtError::PolicyDenied(
                 "profile management requests are MCP-only".into(),
             ));
@@ -316,12 +372,7 @@ impl GatewayService {
             }
             Request::ProfileDelete { profile, .. } => {
                 ensure_profile_deletable(config, &profile)?;
-                if self
-                    .sessions
-                    .lock()
-                    .await
-                    .has_profile_session(session_namespace, &profile)
-                {
+                if self.sessions.lock().await.has_any_profile_session(&profile) {
                     return Err(ArrtError::ProfileInUse(format!(
                         "profile {profile} has an active session"
                     )));
@@ -337,15 +388,39 @@ impl GatewayService {
                 ))
             }
         };
-        self.execute_profile_mutation(config, request, session_namespace)
-            .await
+        if config.runtime.mode == RuntimeMode::Cloud {
+            let redactor = match &request {
+                Request::ProfileCreate { profile } => {
+                    SecretRedactor::from_config_and_profile_with_credentials(
+                        config,
+                        profile,
+                        self.credentials.as_ref(),
+                    )
+                }
+                _ => {
+                    SecretRedactor::from_config_with_credentials(config, self.credentials.as_ref())
+                }
+            };
+            let approval = self.approvals.open(config)?.create(
+                &request,
+                principal.caller_type,
+                None,
+                Some("Cloud profile mutation requires human approval"),
+                Some(RiskLevelConfig::High),
+                &redactor,
+                None,
+            )?;
+            self.audit_approval(config, principal, "approval_created", &approval);
+            return Ok(CommandResult::success()
+                .with_data(json!({"status":"confirmation_required","approval":approval})));
+        }
+        self.execute_profile_mutation(config, request).await
     }
 
     async fn execute_profile_mutation(
         &self,
         config: &AppConfig,
         request: Request,
-        session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
         let _guard = self.config_access.write().await;
         let mut config = config.reload_if_file_backed().await?;
@@ -376,7 +451,7 @@ impl GatewayService {
                     )));
                 }
                 let sessions = self.sessions.lock().await;
-                if sessions.has_profile_session(session_namespace, &profile) {
+                if sessions.has_any_profile_session(&profile) {
                     return Err(ArrtError::ProfileInUse(format!(
                         "profile {profile} has an active session"
                     )));
@@ -396,12 +471,13 @@ impl GatewayService {
     async fn resolve_operation(
         &self,
         config: &AppConfig,
-        caller: CallerType,
+        principal: &Principal,
         task_id: Option<&str>,
         request: Request,
         redactor: &SecretRedactor,
         session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
+        let caller = principal.caller_type;
         let decision = PolicyEngine::authorize(config, caller, &request)?;
         if decision.effect == PolicyEffect::Deny {
             return Err(ArrtError::PolicyDenied(
@@ -428,7 +504,7 @@ impl GatewayService {
             return self
                 .execute_enveloped(
                     config,
-                    caller,
+                    principal,
                     request,
                     Some(plan),
                     None,
@@ -450,7 +526,7 @@ impl GatewayService {
             return self
                 .execute_enveloped(
                     config,
-                    caller,
+                    principal,
                     request,
                     None,
                     Some(grant_id),
@@ -459,7 +535,7 @@ impl GatewayService {
                 )
                 .await;
         }
-        let approval = ApprovalService::from_config(config)?.create(
+        let approval = self.approvals.open(config)?.create(
             &request,
             caller,
             decision.rule_id.as_deref(),
@@ -468,35 +544,38 @@ impl GatewayService {
             redactor,
             task_id,
         )?;
-        audit_approval("approval_created", &approval, caller);
+        self.audit_approval(config, principal, "approval_created", &approval);
         Ok(CommandResult::success()
             .with_data(json!({"status":"confirmation_required","approval":approval})))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_enveloped(
         &self,
         config: &AppConfig,
-        caller: CallerType,
+        principal: &Principal,
         request: Request,
         plan: Option<PlanAuthorization>,
         grant_id: Option<String>,
         grants: &GrantService,
         session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
+        let caller = principal.caller_type;
         let result = self
             .execute_authorized(config, caller, request, session_namespace)
             .await;
         if let Some(auth) = plan {
             let success = result.as_ref().is_ok_and(|r| r.ok);
             let event = grants.finish_plan_action(&auth, success)?;
-            audit_approval(
+            self.audit_approval(
+                config,
+                principal,
                 if event["status"] == "completed" {
                     "plan_completed"
                 } else {
                     "plan_action_executed"
                 },
                 &event,
-                caller,
             );
         }
         let mut result = result?;
@@ -508,9 +587,14 @@ impl GatewayService {
                     json!({"type":"grant","grant_id":id}),
                 );
             }
-            audit_approval("grant_used", &json!({"grant_id":id}), caller);
+            self.audit_approval(config, principal, "grant_used", &json!({"grant_id":id}));
             if grants.show(&id)?["status"] == "exhausted" {
-                audit_approval("grant_exhausted", &json!({"grant_id":id}), caller);
+                self.audit_approval(
+                    config,
+                    principal,
+                    "grant_exhausted",
+                    &json!({"grant_id":id}),
+                );
             }
         }
         Ok(result)
@@ -519,10 +603,11 @@ impl GatewayService {
     async fn execute_authorization_admin(
         &self,
         config: &AppConfig,
-        caller: CallerType,
+        principal: &Principal,
         request: Request,
         session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
+        let caller = principal.caller_type;
         if matches!(request, Request::PlanPropose { .. }) {
             if caller == CallerType::HumanCli {
                 return Err(ArrtError::PolicyDenied(
@@ -530,7 +615,8 @@ impl GatewayService {
                 ));
             }
             let grants = GrantService::from_config(config)?;
-            let redactor = SecretRedactor::from_config(config);
+            let redactor =
+                SecretRedactor::from_config_with_credentials(config, self.credentials.as_ref());
             if let Request::PlanPropose {
                 profile,
                 task_id,
@@ -552,7 +638,7 @@ impl GatewayService {
                     config.approval.ttl_seconds,
                     &redactor,
                 )?;
-                audit_approval("plan_created", &plan, caller);
+                self.audit_approval(config, principal, "plan_created", &plan);
                 return Ok(CommandResult::success().with_data(json!({"plan":plan})));
             }
         }
@@ -561,7 +647,7 @@ impl GatewayService {
                 "approval administration requires Human CLI".into(),
             ));
         }
-        let approvals = ApprovalService::from_config(config)?;
+        let approvals = self.approvals.open(config)?;
         match request {
             Request::ApprovalList => {
                 Ok(CommandResult::success().with_data(json!({"approvals":approvals.list()?})))
@@ -569,7 +655,7 @@ impl GatewayService {
             Request::ApprovalShow { approval_id } => {let mut approval=approvals.show(&approval_id)?;add_approval_suggestions(config,&mut approval);Ok(CommandResult::success().with_data(json!({"approval":approval})))},
             Request::ApprovalReject { approval_id } => {
                 let data = approvals.reject(&approval_id)?;
-                audit_approval("approval_rejected", &approvals.show(&approval_id)?, caller);
+                self.audit_approval(config, principal, "approval_rejected", &approvals.show(&approval_id)?);
                 Ok(CommandResult::success().with_data(data))
             }
             Request::ApprovalCleanup => {
@@ -602,9 +688,9 @@ impl GatewayService {
                     return Ok(failed);
                 }
                 if matches!(&claim.request, Request::ProfileCreate { .. } | Request::ProfileDelete { .. }) {
-                    audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
+                    self.audit_approval(config, principal, "approval_approved", &approvals.show(&claim.id)?);
                     let mut result = self
-                        .execute_profile_mutation(config, claim.request.clone(), session_namespace)
+                        .execute_profile_mutation(config, claim.request.clone())
                         .await
                         .unwrap_or_else(|err| error_result(err, &claim.request));
                     let current_config = config
@@ -613,16 +699,15 @@ impl GatewayService {
                         .unwrap_or_else(|_| config.clone());
                     let redactor = match &claim.request {
                         Request::ProfileCreate { profile } => {
-                            SecretRedactor::from_config_and_profile(&current_config, profile)
+                            SecretRedactor::from_config_and_profile_with_credentials(&current_config, profile, self.credentials.as_ref())
                         }
-                        _ => SecretRedactor::from_config(&current_config),
+                        _ => SecretRedactor::from_config_with_credentials(&current_config, self.credentials.as_ref()),
                     };
                     redact_result(&redactor, &mut result);
                     approvals.finish(&claim.id, &result)?;
-                    audit_approval(
+                    self.audit_approval(config, principal,
                         if result.ok { "approval_executed" } else { "approval_failed" },
                         &approvals.show(&claim.id)?,
-                        caller,
                     );
                     return Ok(CommandResult::success().with_data(json!({"status":if result.ok{"executed"}else{"failed"},"approval_id":claim.id,"result":result})));
                 }
@@ -651,47 +736,69 @@ impl GatewayService {
                 if let Some((grants,ttl))=grant_request {
                     if decision.effect == PolicyEffect::Confirm {
                         let grant=decision.rule_id.as_deref().ok_or_else(||ArrtError::Approval("confirm decision has no rule id".into())).and_then(|rule_id|grants.create_from_claimed_approval(&claim.id,ttl,grant_task_id.as_deref(),max_uses,rule_id));
-                        match grant{Ok(grant)=>audit_approval("grant_created",&grant,caller),Err(err)=>{let failed=error_result(err,&claim.request);approvals.finish(&claim.id,&failed)?;return Ok(failed);}}
+                        match grant{Ok(grant)=>self.audit_approval(config,principal,"grant_created",&grant),Err(err)=>{let failed=error_result(err,&claim.request);approvals.finish(&claim.id,&failed)?;return Ok(failed);}}
                     }
                 }
-                audit_approval("approval_approved", &approvals.show(&claim.id)?, caller);
+                self.audit_approval(config, principal, "approval_approved", &approvals.show(&claim.id)?);
                 let mut result = self
                     .execute_authorized(
                         &current_config,
                         claim.caller,
                         claim.request.clone(),
-                        session_namespace,
+                        claim.authorization_namespace.as_deref().unwrap_or(session_namespace),
                     )
                     .await
                     .unwrap_or_else(|e| error_result(e, &claim.request));
-                let redactor = SecretRedactor::from_config(&current_config);
+                let redactor = SecretRedactor::from_config_with_credentials(&current_config, self.credentials.as_ref());
                 redact_result(&redactor, &mut result);
                 approvals.finish(&claim.id, &result)?;
-                audit_approval(
+                self.audit_approval(config, principal,
                     if result.ok {
                         "approval_executed"
                     } else {
                         "approval_failed"
                     },
                     &approvals.show(&claim.id)?,
-                    caller,
                 );
                 Ok(CommandResult::success().with_data(json!({"status":if result.ok{"executed"}else{"failed"},"approval_id":claim.id,"result":result})))
             }
             Request::GrantList=>Ok(CommandResult::success().with_data(json!({"grants":GrantService::from_config(config)?.list()?}))),
             Request::GrantShow{grant_id}=>Ok(CommandResult::success().with_data(json!({"grant":GrantService::from_config(config)?.show(&grant_id)?}))),
-            Request::GrantRevoke{grant_id}=>{let data=GrantService::from_config(config)?.revoke(&grant_id)?;audit_approval("grant_revoked",&data,caller);Ok(CommandResult::success().with_data(data))},
+            Request::GrantRevoke{grant_id}=>{let data=GrantService::from_config(config)?.revoke(&grant_id)?;self.audit_approval(config,principal,"grant_revoked",&data);Ok(CommandResult::success().with_data(data))},
             Request::GrantCleanup=>Ok(CommandResult::success().with_data(GrantService::from_config(config)?.cleanup_grants()?)),
             Request::PlanList=>Ok(CommandResult::success().with_data(json!({"plans":GrantService::from_config(config)?.list_plans()?}))),
-            Request::PlanShow{plan_id}=>Ok(CommandResult::success().with_data(json!({"plan":GrantService::from_config(config)?.show_plan(&plan_id,&SecretRedactor::from_config(config))?}))),
-            Request::PlanApprove{plan_id}=>{let data=GrantService::from_config(config)?.approve_plan(&plan_id)?;audit_approval("plan_approved",&data,caller);Ok(CommandResult::success().with_data(data))},
-            Request::PlanReject{plan_id}=>{let data=GrantService::from_config(config)?.reject_plan(&plan_id)?;audit_approval("plan_rejected",&data,caller);Ok(CommandResult::success().with_data(data))},
+            Request::PlanShow{plan_id}=>Ok(CommandResult::success().with_data(json!({"plan":GrantService::from_config(config)?.show_plan(&plan_id,&SecretRedactor::from_config_with_credentials(config, self.credentials.as_ref()))?}))),
+            Request::PlanApprove{plan_id}=>{let data=GrantService::from_config(config)?.approve_plan(&plan_id)?;self.audit_approval(config,principal,"plan_approved",&data);Ok(CommandResult::success().with_data(data))},
+            Request::PlanReject{plan_id}=>{let data=GrantService::from_config(config)?.reject_plan(&plan_id)?;self.audit_approval(config,principal,"plan_rejected",&data);Ok(CommandResult::success().with_data(data))},
             _ => Err(ArrtError::InvalidArgument("not an approval request".into())),
         }
     }
 
+    fn audit_approval(
+        &self,
+        config: &AppConfig,
+        principal: &Principal,
+        event: &str,
+        metadata: &serde_json::Value,
+    ) {
+        let redactor =
+            SecretRedactor::from_config_with_credentials(config, self.credentials.as_ref());
+        let mut safe_metadata = metadata.clone();
+        redactor.redact_value(&mut safe_metadata);
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        self.audit_sink
+            .emit_authorization(&AuthorizationAuditEvent {
+                event,
+                timestamp_ms,
+                principal,
+                metadata: &safe_metadata,
+            });
+    }
+
     pub async fn shutdown(&self) {
-        if let Ok(config) = AppConfig::load().await {
+        if let Ok(config) = self.profiles.load().await {
             self.sessions.lock().await.close_all(&config).await;
         }
     }
@@ -703,6 +810,16 @@ impl GatewayService {
         request: Request,
         session_namespace: &str,
     ) -> Result<CommandResult, ArrtError> {
+        if config.runtime.mode == RuntimeMode::Cloud
+            && matches!(
+                request,
+                Request::TunnelOpen { .. } | Request::TunnelClose { .. }
+            )
+        {
+            return Err(ArrtError::PolicyDenied(
+                "Cloud runtime disables SSH tunnels".into(),
+            ));
+        }
         match request {
             Request::Ping => Ok(CommandResult::success().with_data(json!({
                 "status": "ok",
@@ -716,7 +833,7 @@ impl GatewayService {
                 "profiles": config.profiles.iter().map(|profile| &profile.name).collect::<Vec<_>>()
             }))),
             Request::ProfileShow { name } => {
-                Ok(CommandResult::success().with_data(config.profile_summary(&name)?))
+                Ok(CommandResult::success().with_data(config.profile_summary_with_credentials(&name, self.credentials.as_ref())?))
             }
             Request::ProfileValidate { name } => {
                 config.validate()?;
@@ -965,10 +1082,12 @@ fn redact_result(redactor: &SecretRedactor, result: &mut CommandResult) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit(
+    sink: &dyn AuditSink,
     config: &AppConfig,
     request_id: &str,
-    caller: CallerType,
+    principal: &Principal,
     request: &Request,
     started: Instant,
     result: &CommandResult,
@@ -989,21 +1108,18 @@ fn audit(
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    eprintln!(
-        "{}",
-        json!({
-            "event": "ssh_gateway_audit",
-            "timestamp_ms": timestamp_ms,
-            "request_id": request_id,
-            "caller": format!("{caller:?}").to_ascii_lowercase(),
-            "tool": request_name(request),
-            "profile": profile,
-            "command": command,
-            "duration_ms": started.elapsed().as_millis(),
-            "result": if result.ok { "ok" } else { "error" },
-            "error_code": result.error.as_ref().map(|error| &error.code),
-        })
-    );
+    sink.emit(&AuditEvent {
+        event: "ssh_gateway_audit",
+        timestamp_ms,
+        request_id,
+        principal,
+        operation: request_name(request),
+        profile,
+        command,
+        duration_ms: started.elapsed().as_millis(),
+        success: result.ok,
+        error_code: result.error.as_ref().map(|error| error.code.as_str()),
+    });
 }
 
 fn request_profile(request: &Request) -> Option<&str> {
@@ -1060,13 +1176,6 @@ fn request_name(request: &Request) -> &'static str {
     }
 }
 
-fn audit_approval(event: &str, metadata: &serde_json::Value, caller: CallerType) {
-    eprintln!(
-        "{}",
-        json!({"event":event,"caller":format!("{caller:?}").to_ascii_lowercase(),"metadata":metadata,"timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|d|d.as_millis())})
-    );
-}
-
 fn add_approval_suggestions(config: &AppConfig, approval: &mut serde_json::Value) {
     let risk = approval["risk"].as_str().unwrap_or("low");
     let policy = match risk {
@@ -1098,6 +1207,159 @@ fn add_approval_suggestions(config: &AppConfig, approval: &mut serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cloud_runtime_rejects_tunnel_before_connection() {
+        let mut config = AppConfig::default();
+        config.runtime.mode = RuntimeMode::Cloud;
+        let service = GatewayService::new();
+        let result = service
+            .execute_authorized(
+                &config,
+                CallerType::HumanCli,
+                Request::TunnelOpen {
+                    profile: "missing".into(),
+                    local_port: 1234,
+                    remote_host: "example.com".into(),
+                    remote_port: 80,
+                },
+                "test",
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ArrtError::PolicyDenied(message)) if message.contains("disables SSH tunnels"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_profile_deletion_requires_single_use_human_approval() {
+        let dir = std::env::temp_dir().join(format!(
+            "ssh-gateway-cloud-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profiles.yaml");
+        let db = dir.join("approvals.db");
+        std::fs::write(&path, format!("runtime:\n  mode: cloud\n  host_key_mode: strict\napproval:\n  storage:\n    type: sqlite\n    path: {}\nmcp:\n  profile_management:\n    enabled: true\nprofiles:\n  - name: first\n    target:\n      host: example.com\n      user: root\n      auth: {{ type: password, password: secret-one }}\n  - name: second\n    target:\n      host: example.net\n      user: root\n      auth: {{ type: password, password: secret-two }}\n", db.display())).unwrap();
+        let mut config = AppConfig::load_from_path(path.clone()).await.unwrap();
+        let principal = Principal::local(CallerType::Mcp);
+        config.authorization_namespace = Some(principal.execution_namespace());
+        let service = GatewayService::new();
+        let result = service
+            .execute_mcp_profile_management(
+                &config,
+                &principal,
+                Request::ProfileDelete {
+                    profile: "second".into(),
+                    expected_profile_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.data.as_ref().unwrap()["status"],
+            "confirmation_required"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("name: second"));
+        let approval_id = result.data.unwrap()["approval"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let human = Principal::local(CallerType::HumanCli);
+        let approved = service
+            .execute_authorization_admin(
+                &config,
+                &human,
+                Request::ApprovalApprove {
+                    approval_id: approval_id.clone(),
+                    grant_ttl_seconds: None,
+                    grant_task_id: None,
+                    max_uses: None,
+                },
+                "human",
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.data.as_ref().unwrap()["status"], "executed");
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("name: second"));
+        assert!(service
+            .execute_authorization_admin(
+                &config,
+                &human,
+                Request::ApprovalApprove {
+                    approval_id,
+                    grant_ttl_seconds: None,
+                    grant_task_id: None,
+                    max_uses: None
+                },
+                "human"
+            )
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audit_sink_receives_redacted_command_and_principal() {
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        impl AuditSink for Capture {
+            fn emit(&self, event: &AuditEvent<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_string(event).unwrap());
+            }
+            fn emit_authorization(&self, event: &AuthorizationAuditEvent<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_string(event).unwrap());
+            }
+        }
+        let config: AppConfig = serde_yaml::from_str("profiles:\n  - name: host\n    target:\n      host: example.com\n      user: root\n      auth:\n        type: password\n        password: secret-value\n").unwrap();
+        let redactor = SecretRedactor::from_config(&config);
+        let principal = Principal::local(CallerType::Mcp);
+        let request = Request::Exec {
+            profile: "host".into(),
+            command: "echo secret-value".into(),
+            cwd: None,
+            timeout_seconds: None,
+            env: Vec::new(),
+        };
+        let sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        audit(
+            sink.as_ref(),
+            &config,
+            "request",
+            &principal,
+            &request,
+            Instant::now(),
+            &CommandResult::success(),
+            &redactor,
+        );
+        let service = GatewayService::with_providers(
+            Arc::new(FileProfileStore),
+            Arc::new(FileCredentialStore),
+            Arc::new(SqliteApprovalStoreFactory),
+            sink.clone(),
+        );
+        service.audit_approval(
+            &config,
+            &principal,
+            "approval_created",
+            &json!({"summary":"secret-value"}),
+        );
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events.iter() {
+            assert!(!event.contains("secret-value"));
+            assert!(event.contains("local-bearer"));
+        }
+    }
 
     #[test]
     fn transfer_prevalidation_preserves_daemon_boundary() {
@@ -1171,7 +1433,7 @@ mod tests {
         let result = GatewayService::new()
             .resolve_operation(
                 &config,
-                CallerType::Mcp,
+                &Principal::local(CallerType::Mcp),
                 Some("task"),
                 request,
                 &SecretRedactor::from_config(&config),
@@ -1223,7 +1485,7 @@ mod tests {
         let result = GatewayService::new()
             .execute_authorization_admin(
                 &config,
-                CallerType::HumanCli,
+                &Principal::local(CallerType::HumanCli),
                 Request::ApprovalApprove {
                     approval_id: id,
                     grant_ttl_seconds: Some(60),
@@ -1285,7 +1547,7 @@ mod tests {
         let _ = GatewayService::new()
             .execute_authorization_admin(
                 &config,
-                CallerType::HumanCli,
+                &Principal::local(CallerType::HumanCli),
                 Request::ApprovalApprove {
                     approval_id: id,
                     grant_ttl_seconds: None,
@@ -1376,7 +1638,7 @@ mod tests {
         let result = GatewayService::new()
             .execute_authorization_admin(
                 &config,
-                CallerType::HumanCli,
+                &Principal::local(CallerType::HumanCli),
                 Request::ApprovalApprove {
                     approval_id: id,
                     grant_ttl_seconds: Some(60),

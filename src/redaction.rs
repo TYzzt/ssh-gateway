@@ -1,4 +1,7 @@
 use crate::config::{AppConfig, AuthConfig, Profile, ResolvedAuthConfig, ResolvedTransport};
+use crate::storage::CredentialStore;
+#[cfg(test)]
+use crate::storage::FileCredentialStore;
 use serde_json::Value;
 
 #[derive(Default)]
@@ -7,10 +10,20 @@ pub struct SecretRedactor {
 }
 
 impl SecretRedactor {
+    #[cfg(test)]
     pub fn from_config(config: &AppConfig) -> Self {
+        Self::from_config_with_credentials(config, &FileCredentialStore)
+    }
+
+    pub fn from_config_with_credentials(
+        config: &AppConfig,
+        credentials: &dyn CredentialStore,
+    ) -> Self {
         let mut secrets = Vec::new();
         for profile in &config.profiles {
-            if let Ok(resolved) = config.resolved_profile(&profile.name) {
+            if let Ok(resolved) =
+                config.resolved_profile_with_credentials(&profile.name, credentials)
+            {
                 if let ResolvedTransport::Direct { target, bastions } = resolved.transport {
                     collect_auth(&target.auth, &mut secrets);
                     for bastion in bastions {
@@ -27,8 +40,17 @@ impl SecretRedactor {
         Self { secrets }
     }
 
+    #[cfg(test)]
     pub fn from_config_and_profile(config: &AppConfig, profile: &Profile) -> Self {
-        let mut redactor = Self::from_config(config);
+        Self::from_config_and_profile_with_credentials(config, profile, &FileCredentialStore)
+    }
+
+    pub fn from_config_and_profile_with_credentials(
+        config: &AppConfig,
+        profile: &Profile,
+        credentials: &dyn CredentialStore,
+    ) -> Self {
+        let mut redactor = Self::from_config_with_credentials(config, credentials);
         collect_raw_auth(profile.auth.as_ref(), &mut redactor.secrets);
         collect_raw_auth(profile.target.auth.as_ref(), &mut redactor.secrets);
         for endpoint in &profile.bastions {

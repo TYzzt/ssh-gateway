@@ -15,11 +15,13 @@ pub struct ApprovalClaim {
     pub request: Request,
     pub caller: CallerType,
     pub request_hash: String,
+    pub authorization_namespace: Option<String>,
 }
 
 pub struct ApprovalService {
     path: PathBuf,
     ttl_seconds: u64,
+    namespace: Option<String>,
 }
 
 impl ApprovalService {
@@ -43,6 +45,7 @@ impl ApprovalService {
         let service = Self {
             path,
             ttl_seconds: config.approval.ttl_seconds,
+            namespace: config.authorization_namespace.clone(),
         };
         let _guard = DB_SCHEMA_LOCK
             .lock()
@@ -96,6 +99,13 @@ impl ApprovalService {
             conn.execute("ALTER TABLE approvals ADD COLUMN task_id TEXT", [])
                 .map_err(db_error)?;
         }
+        if !has_column(&conn, "approvals", "authorization_namespace")? {
+            conn.execute(
+                "ALTER TABLE approvals ADD COLUMN authorization_namespace TEXT",
+                [],
+            )
+            .map_err(db_error)?;
+        }
         Ok(conn)
     }
 
@@ -121,8 +131,8 @@ impl ApprovalService {
         let operation = request_name(request);
         let summary = redactor.redact(&safe_summary(request));
         let risk = risk.map(risk_name);
-        self.connection()?.execute("INSERT INTO approvals (id,created_at,expires_at,profile,operation,request_payload,request_hash,rule_id,reason,risk,caller,status,summary,task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![id, now, expires, profile, operation, payload, request_hash, rule_id, reason, risk, caller_name(caller), "pending", summary,task_id]).map_err(db_error)?;
+        self.connection()?.execute("INSERT INTO approvals (id,created_at,expires_at,profile,operation,request_payload,request_hash,rule_id,reason,risk,caller,status,summary,task_id,authorization_namespace) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![id, now, expires, profile, operation, payload, request_hash, rule_id, reason, risk, caller_name(caller), "pending", summary,task_id,self.namespace.as_deref()]).map_err(db_error)?;
         Ok(
             json!({"id":id,"profile":profile,"operation":operation,"summary":summary,"risk":risk,"expires_at":expires,"rule_id":rule_id,"task_id":task_id}),
         )
@@ -154,8 +164,8 @@ impl ApprovalService {
         self.expire()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction().map_err(db_error)?;
-        let row = tx.query_row("SELECT request_payload,request_hash,caller FROM approvals WHERE id=? AND status='pending' AND expires_at>?", params![id, now_seconds()], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional().map_err(db_error)?;
-        let Some((payload, stored_hash, caller)) = row else {
+        let row = tx.query_row("SELECT request_payload,request_hash,caller,authorization_namespace FROM approvals WHERE id=? AND status='pending' AND expires_at>? AND (? IS NULL OR authorization_namespace=?)", params![id, now_seconds(),self.namespace.as_deref(),self.namespace.as_deref()], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?))).optional().map_err(db_error)?;
+        let Some((payload, stored_hash, caller, authorization_namespace)) = row else {
             return Err(ArrtError::Approval("already_processed or expired".into()));
         };
         let request: Request =
@@ -178,6 +188,7 @@ impl ApprovalService {
             request,
             caller: parse_caller(&caller)?,
             request_hash: stored_hash,
+            authorization_namespace,
         })
     }
 
@@ -388,6 +399,21 @@ fn now_seconds() -> u64 {
 fn db_error(e: rusqlite::Error) -> ArrtError {
     ArrtError::Approval(format!("approval database: {e}"))
 }
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, ArrtError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(db_error)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_error)?;
+    for name in names {
+        if name.map_err(db_error)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 fn risk_name(r: RiskLevelConfig) -> &'static str {
     match r {
         RiskLevelConfig::Low => "low",
@@ -445,6 +471,38 @@ mod tests {
     use crate::protocol::EnvVar;
     use std::sync::{Arc, Barrier};
 
+    #[test]
+    fn approval_claim_preserves_requester_namespace() {
+        let (service, path) = service(300);
+        let mut config: AppConfig = serde_yaml::from_str("profiles: []").unwrap();
+        config.approval.storage.path = Some(path.display().to_string());
+        config.authorization_namespace = Some("tenant-a:user-a".into());
+        let first = ApprovalService::from_config(&config).unwrap();
+        let id = first
+            .create(
+                &request(),
+                CallerType::Mcp,
+                Some("rule"),
+                None,
+                Some(RiskLevelConfig::Medium),
+                &SecretRedactor::default(),
+                None,
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        config.authorization_namespace = Some("tenant-b:user-b".into());
+        let second = ApprovalService::from_config(&config).unwrap();
+        assert!(second.claim(&id).is_err());
+        let claim = service.claim(&id).unwrap();
+        assert_eq!(
+            claim.authorization_namespace.as_deref(),
+            Some("tenant-a:user-a")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     fn service(ttl: u64) -> (ApprovalService, PathBuf) {
         let path =
             std::env::temp_dir().join(format!("ssh-gateway-approval-{}.db", uuid::Uuid::new_v4()));
@@ -497,6 +555,7 @@ mod tests {
         let reopened = ApprovalService {
             path: path.clone(),
             ttl_seconds: 300,
+            namespace: None,
         };
         assert_eq!(reopened.list().unwrap().as_array().unwrap().len(), 1);
         let shown = reopened.show(id).unwrap();

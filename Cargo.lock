@@ -2717,14 +2717,16 @@ dependencies = [
 
 [[package]]
 name = "ssh-gateway"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
  "clap",
  "directories",
  "jsonwebtoken",
+ "rand 0.10.1",
  "reqwest",
+ "rsa",
  "rusqlite",
  "russh",
  "serde",

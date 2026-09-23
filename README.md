@@ -40,7 +40,7 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 - **Secret isolation at the gateway API boundary**: the daemon reads passwords, key paths, and optional key passphrases from config; callers send only `profile` plus operation arguments.
 - **Redacted profile and session output**: `profile show`, `session inspect`, and error payloads never echo raw passwords or passphrases.
 - **Profile-first agent workflow**: agents use named profiles instead of embedding secrets in `ssh` commands.
-- **User-confirmed profile management**: MCP can inspect policy and, when explicitly enabled, create or delete profiles after the MCP client obtains user confirmation.
+- **Controlled profile management**: MCP can inspect policy and, when explicitly enabled, request profile creation or deletion. Self-hosted mode uses MCP client confirmation; Cloud runtime mode requires Human CLI approval.
 - **Embedded SSH transport with session reuse**: direct and bastion profiles use in-process SSH instead of spawning local `ssh.exe` or `scp`.
 - **No local OpenSSH dependency for direct or bastion mode**: Windows and Linux direct transports run through the embedded client stack.
 - **Per-hop auth for bastions and targets**: every hop can use its own password or key configuration.
@@ -48,10 +48,33 @@ It is intentionally **not** a general-purpose SSH client replacement. The projec
 - **Managed remote agent lifecycle**: version checks, bootstrap, and reuse happen on connect.
 - **JSON-only CLI**: predictable automation surface for `daemon`, `profile`, `exec`, `read`, `write`, `upload`, `download`, `tunnel`, and `session`.
 - **Two agent interfaces**: local agents use CLI + Skill; remote agents use the Streamable HTTP MCP server with static Bearer or OAuth JWT authentication.
-- **OAuth multi-tenant isolation for MCP**: external OIDC/JWT providers can route different audiences/resources to different profile files, local file roots, approval stores, and session namespaces.
+- **OAuth resource routing for MCP**: external OIDC/JWT providers can route different audiences/resources to profile files and local file roots. Sessions are also isolated by authenticated subject and tenant identifier.
 - **Agent Policy**: capability gates, exact command allowlists, and remotely resolved path restrictions apply to `--agent` CLI calls and every MCP call without changing legacy human CLI behavior.
 
 ## Security Model
+
+### Runtime modes and host keys
+
+Normal local installations use `self_hosted` mode. Existing YAML works without migration. For secure host key checking, set `runtime.host_key_mode: strict` and add an OpenSSH SHA256 fingerprint to the target and every bastion:
+
+```yaml
+runtime:
+  mode: self_hosted
+  host_key_mode: strict
+profiles:
+  - name: production
+    target:
+      host: server.example.com
+      user: deploy
+      host_key_sha256: "SHA256:replace-with-verified-fingerprint"
+      auth: { type: key, key_path: ~/.ssh/id_ed25519 }
+```
+
+The default `insecure_compatibility` host key setting preserves old self-hosted behavior and accepts unpinned keys. It is insecure against SSH server impersonation. A configured pin is enforced even in this mode.
+
+`runtime.mode: cloud` is a Cloud-ready core safety mode. It requires strict host keys, rejects SSH tunnels, blocks unsafe resolved network destinations, and requires IP literals for hops resolved by a bastion. It currently rejects delegated `via_profile` routes. It is not a hosted service. See [architecture](docs/architecture.md) and [security model](docs/security-model.md) for trust boundaries and current limits.
+
+Authentication creates a `Principal` for each MCP or CLI caller. OAuth JWT `sub` identifies the caller; `mcp.tenants[].tenant_id` can identify the tenant separately from the resource audience. Sessions and authorization records use an internal namespace derived from that identity. The gateway resolves credentials behind its profile store boundary and emits redacted audit events through a replaceable sink.
 
 <p align="center">
   <img src="docs/readme/security.svg" alt="Security boundary for profile-driven secrets and redacted outputs" width="100%">
@@ -366,14 +389,14 @@ The repository ships a tag-driven GitHub Actions workflow at [.github/workflows/
 
 - Trigger: push a tag that matches `v*`
 - Build matrix: Windows x64 and Linux x64
-- Steps: checkout, install Rust stable, `cargo test --locked`, `cargo build --release --locked`, package artifacts, create GitHub Release, upload binaries plus `SHA256SUMS`
+- Steps: checkout, install Rust stable, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --locked`, `cargo build --release --locked`, package artifacts, create GitHub Release, upload binaries plus `SHA256SUMS`
 - Release notes: generated automatically by GitHub
 
 Example:
 
 ```bash
-git tag v0.1.5
-git push origin v0.1.5
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ## License

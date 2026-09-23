@@ -1,4 +1,10 @@
 # Preferred YAML config format.
+# Existing self-hosted profiles use insecure_compatibility host-key mode by default.
+# For verified connections, set runtime.host_key_mode: strict and add a checked
+# host_key_sha256: "SHA256:..." to the target and every bastion.
+# runtime:
+#   mode: self_hosted
+#   host_key_mode: strict
 approval:
   enabled: true
   ttl_seconds: 300

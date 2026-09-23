@@ -24,6 +24,14 @@ pub enum ArrtError {
     RequestTimeout(String),
     #[error("ssh error: {0}")]
     Ssh(String),
+    #[error("untrusted SSH host key for {host}: {fingerprint}")]
+    HostKeyUntrusted { host: String, fingerprint: String },
+    #[error("SSH host key changed for {host}: expected {expected}, received {actual}")]
+    HostKeyChanged {
+        host: String,
+        expected: String,
+        actual: String,
+    },
     #[error("agent error: {0}")]
     Agent(String),
     #[error("session not found: {0}")]
@@ -54,6 +62,8 @@ impl ArrtError {
             Self::Ipc(_) => "ipc_error",
             Self::RequestTimeout(_) => "request_timeout",
             Self::Ssh(_) => "ssh_error",
+            Self::HostKeyUntrusted { .. } => "host_key_untrusted",
+            Self::HostKeyChanged { .. } => "host_key_changed",
             Self::Agent(_) => "agent_error",
             Self::SessionNotFound(_) => "session_not_found",
             Self::InvalidArgument(_) => "invalid_argument",

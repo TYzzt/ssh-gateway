@@ -1,5 +1,6 @@
 mod agent;
 mod approval;
+mod audit;
 mod cli;
 mod config;
 mod daemon;
@@ -8,11 +9,14 @@ mod grant;
 mod ipc;
 mod mcp;
 mod policy;
+mod principal;
 mod protocol;
 mod redaction;
 mod service;
 mod session;
 mod ssh;
+mod storage;
+mod target;
 
 use clap::Parser;
 

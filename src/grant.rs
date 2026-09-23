@@ -14,6 +14,7 @@ const PLAN_CLAIM_MAX_LEASE_SECONDS: u64 = 3660;
 pub struct GrantService {
     path: PathBuf,
     config: GrantConfig,
+    namespace: Option<String>,
 }
 #[derive(Debug)]
 pub struct PlanAuthorization {
@@ -33,6 +34,7 @@ impl GrantService {
         let service = Self {
             path,
             config: config.approval.grants.clone(),
+            namespace: config.authorization_namespace.clone(),
         };
         let _guard = DB_SCHEMA_LOCK
             .lock()
@@ -79,6 +81,15 @@ impl GrantService {
                 [],
             )
             .map_err(db_error)?;
+        }
+        for table in ["approvals", "approval_grants", "execution_plans"] {
+            if !has_column(&conn, table, "authorization_namespace")? {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN authorization_namespace TEXT"),
+                    [],
+                )
+                .map_err(db_error)?;
+            }
         }
         conn.execute("UPDATE execution_plans SET claim_expires_at=? WHERE status='executing' AND claimed_index IS NOT NULL AND claim_expires_at IS NULL",[now_seconds()]).map_err(db_error)?;
         Ok(())
@@ -146,7 +157,14 @@ impl GrantService {
         let id = format!("grt_{}", uuid::Uuid::new_v4().simple());
         let expires = now + ttl;
         let scope = json!({"type":if task_id.is_some(){"task_rule"}else{"time_rule"},"profile":profile,"rule_id":rule_id});
-        conn.execute("INSERT INTO approval_grants(id,profile,rule_id,task_id,scope_json,created_at,expires_at,max_uses,status,created_from_approval_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![id,profile,rule_id,task_id,scope.to_string(),now,expires,max_uses,"active",approval_id,"human_cli"]).map_err(db_error)?;
+        let namespace: Option<String> = conn
+            .query_row(
+                "SELECT authorization_namespace FROM approvals WHERE id=?",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        conn.execute("INSERT INTO approval_grants(id,profile,rule_id,task_id,scope_json,created_at,expires_at,max_uses,status,created_from_approval_id,created_by,authorization_namespace) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![id,profile,rule_id,task_id,scope.to_string(),now,expires,max_uses,"active",approval_id,"human_cli",namespace]).map_err(db_error)?;
         Ok(
             json!({"id":id,"profile":profile,"rule_id":rule_id,"task_id":task_id,"scope":scope,"created_at":now,"expires_at":expires,"max_uses":max_uses,"used_count":0,"status":"active","created_from_approval_id":approval_id,"created_by":"human_cli"}),
         )
@@ -229,11 +247,18 @@ impl GrantService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
         let ids = {
-            let mut stmt=tx.prepare("SELECT id FROM approval_grants WHERE profile=? AND rule_id=? AND status='active' AND expires_at>? AND (task_id IS NULL OR task_id=?) AND (max_uses IS NULL OR used_count<max_uses) ORDER BY CASE WHEN task_id IS NULL THEN 1 ELSE 0 END,created_at DESC").map_err(db_error)?;
+            let mut stmt=tx.prepare("SELECT id FROM approval_grants WHERE profile=? AND rule_id=? AND authorization_namespace IS ? AND status='active' AND expires_at>? AND (task_id IS NULL OR task_id=?) AND (max_uses IS NULL OR used_count<max_uses) ORDER BY CASE WHEN task_id IS NULL THEN 1 ELSE 0 END,created_at DESC").map_err(db_error)?;
             let rows = stmt
-                .query_map(params![profile, rule_id, now_seconds(), task_id], |r| {
-                    r.get::<_, String>(0)
-                })
+                .query_map(
+                    params![
+                        profile,
+                        rule_id,
+                        self.namespace.as_deref(),
+                        now_seconds(),
+                        task_id
+                    ],
+                    |r| r.get::<_, String>(0),
+                )
                 .map_err(db_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?
         };
@@ -304,7 +329,7 @@ impl GrantService {
         let now = now_seconds();
         let expires = now + ttl.min(self.config.max_ttl_seconds);
         let id = format!("pln_{}", uuid::Uuid::new_v4().simple());
-        self.connection()?.execute("INSERT INTO execution_plans(id,profile,task_id,actions_json,plan_hash,created_at,expires_at,status) VALUES(?,?,?,?,?,?,?,'pending')",params![id,profile,task_id,payload,hash,now,expires]).map_err(db_error)?;
+        self.connection()?.execute("INSERT INTO execution_plans(id,profile,task_id,actions_json,plan_hash,created_at,expires_at,status,authorization_namespace) VALUES(?,?,?,?,?,?,?,'pending',?)",params![id,profile,task_id,payload,hash,now,expires,self.namespace.as_deref()]).map_err(db_error)?;
         Ok(
             json!({"id":id,"profile":profile,"task_id":task_id,"action_count":actions.len(),"actions":plan_summaries(actions,redactor)?,"hash":hash,"status":"pending","created_at":now,"expires_at":expires}),
         )
@@ -362,7 +387,7 @@ impl GrantService {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        let row=tx.query_row("SELECT id,actions_json,next_index,claimed_index,plan_hash FROM execution_plans WHERE profile=? AND task_id=? AND status IN('approved','executing') AND expires_at>? ORDER BY created_at DESC LIMIT 1",params![profile,task_id,now_seconds()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,String>(4)?))).optional().map_err(db_error)?;
+        let row=tx.query_row("SELECT id,actions_json,next_index,claimed_index,plan_hash FROM execution_plans WHERE profile=? AND task_id=? AND authorization_namespace IS ? AND status IN('approved','executing') AND expires_at>? ORDER BY created_at DESC LIMIT 1",params![profile,task_id,self.namespace.as_deref(),now_seconds()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,String>(4)?))).optional().map_err(db_error)?;
         let Some((id, payload, index, claimed, stored_hash)) = row else {
             return Ok(None);
         };
@@ -659,6 +684,50 @@ mod tests {
             .as_str()
             .unwrap()
             .into()
+    }
+
+    #[test]
+    fn grants_and_plans_are_isolated_by_authorization_namespace() {
+        let (mut first, path) = setup();
+        first.authorization_namespace = Some("tenant-a:user-a".into());
+        let mut second = first.clone();
+        second.authorization_namespace = Some("tenant-b:user-b".into());
+        let approval = pending(&first, "rule-a", RiskLevelConfig::Medium);
+        let first_grants = GrantService::from_config(&first).unwrap();
+        first_grants
+            .create_from_approval(&approval, 300, Some("task-a"), Some(2))
+            .unwrap();
+        let second_grants = GrantService::from_config(&second).unwrap();
+        assert!(second_grants
+            .consume("a", "rule-a", Some("task-a"))
+            .unwrap()
+            .is_none());
+        assert!(first_grants
+            .consume("a", "rule-a", Some("task-a"))
+            .unwrap()
+            .is_some());
+
+        let plan = first_grants
+            .propose_plan(
+                "a",
+                "task-a",
+                &[exec("a", "restart")],
+                300,
+                &SecretRedactor::default(),
+            )
+            .unwrap();
+        first_grants
+            .approve_plan(plan["id"].as_str().unwrap())
+            .unwrap();
+        assert!(second_grants
+            .claim_plan_action("a", Some("task-a"), &exec("a", "restart"))
+            .unwrap()
+            .is_none());
+        assert!(first_grants
+            .claim_plan_action("a", Some("task-a"), &exec("a", "restart"))
+            .unwrap()
+            .is_some());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
