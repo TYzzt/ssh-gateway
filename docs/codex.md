@@ -1,20 +1,20 @@
 # Codex
 
-When a tool returns `status: confirmation_required`, stop and report its ID, summary, risk, and expiry. Never run `ssh-gateway approval approve`, invoke it through a shell, or rewrite the request to evade policy. A human must approve from a non-agent CLI; then inspect the recorded result before continuing. See [Human approval](approval.md).
+When a tool returns `status: confirmation_required`, stop and report its ID, summary, risk, and expiry. Never run `sshmcp approval approve`, invoke it through a shell, or rewrite the request to evade policy. A human must approve from a non-agent CLI; then inspect the recorded result before continuing. See [Human approval](approval.md).
 
 Use the stable task ID assigned to the current task. After a human creates a task grant, continue normally; never request wildcard scope, extend grants, switch task IDs, or use another task's grant. Agents may propose an ordered Plan, but must never approve or alter it and must execute approved actions in order.
 
-Codex should use the local `ssh-gateway` Skill and CLI. MCP is not required for this workflow. If Codex is connected through MCP instead, configure `/mcp` as a custom MCP server and use either the static Bearer token mode or OAuth mode backed by an external OIDC provider.
+Codex should use the local `sshmcp` Skill and CLI. MCP is not required for this workflow. If Codex is connected through MCP instead, configure `/mcp` as a custom MCP server and use either the static Bearer token mode or OAuth mode backed by an external OIDC provider.
 
 ## Install
 
-Download the Windows or Linux release archive, place `ssh-gateway` on `PATH`, then install the repository Skill:
+Download the Windows or Linux release archive, place `sshmcp` on `PATH`, then install the repository Skill:
 
 ```text
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway
+npx skills add sshmcp/sshmcp --skill sshmcp
 ```
 
-Set `ARRT_CONFIG_PATH` to a YAML/TOML profile file, or use the platform default described in the README.
+Set `SSHMCP_CONFIG_PATH` to a YAML/TOML profile file, or use the platform default described in the README.
 
 Existing self-hosted profiles remain valid. For verified SSH connections, set `runtime.host_key_mode: strict` and configure a checked `host_key_sha256` fingerprint on the target and every bastion. The default `insecure_compatibility` mode accepts unpinned keys and is vulnerable to SSH server impersonation. See the [security model](security-model.md).
 
@@ -23,11 +23,11 @@ Existing self-hosted profiles remain valid. For verified SSH connections, set `r
 Codex should discover named hosts without asking for credentials:
 
 ```text
-ssh-gateway profile list
-ssh-gateway profile validate aliyun
-ssh-gateway exec --agent --profile aliyun -- docker ps
-ssh-gateway read --agent --profile aliyun --path /etc/nginx/nginx.conf
-ssh-gateway write --agent --profile aliyun --path /home/admin/demo --input hello
+sshmcp profile list
+sshmcp profile validate aliyun
+sshmcp exec --agent --profile aliyun -- docker ps
+sshmcp read --agent --profile aliyun --path /etc/nginx/nginx.conf
+sshmcp write --agent --profile aliyun --path /home/admin/demo --input hello
 ```
 
 `--agent` can appear before or after the subcommand. It applies the selected profile's `agent_policy`. Without it, existing human CLI behavior is preserved.

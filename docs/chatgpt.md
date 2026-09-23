@@ -1,17 +1,17 @@
 # ChatGPT MCP
 
-MCP returns `confirmation_required` as structured content. Tell the user to approve its ID with `ssh-gateway approval approve <id>`. MCP intentionally has no approve/reject tool; do not rewrite and retry the operation. See [Human approval](approval.md).
+MCP returns `confirmation_required` as structured content. Tell the user to approve its ID with `sshmcp approval approve <id>`. MCP intentionally has no approve/reject tool; do not rewrite and retry the operation. See [Human approval](approval.md).
 
 MCP tool calls do not accept `task_id` from the agent. For bounded task grants and Plans, configure the gateway to inject a stable task ID from an environment variable. `propose_plan` may persist an ordered proposal without executing it; plan and grant approval remain Human CLI-only.
 
-`ssh-gateway` exposes a Streamable HTTP MCP endpoint at `/mcp`. It supports legacy static Bearer authentication and OAuth JWT resource-server authentication for ChatGPT/Codex custom MCP clients. It does not use the obsolete ChatGPT Plugin Manifest.
+`sshmcp` exposes a Streamable HTTP MCP endpoint at `/mcp`. It supports legacy static Bearer authentication and OAuth JWT resource-server authentication for ChatGPT/Codex custom MCP clients. It does not use the obsolete ChatGPT Plugin Manifest.
 
 ## NAS deployment
 
 Configure profiles and policy in `config/profiles.yaml`, then start the compose service:
 
 ```bash
-export SSH_GATEWAY_MCP_TOKEN="$(openssl rand -hex 32)"
+export SSHMCP_MCP_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d --build
 curl http://127.0.0.1:8765/health
 ```
@@ -24,9 +24,9 @@ sudo chown -R 10001:10001 config
 
 Restart the MCP service after changing the enablement setting so clients receive the updated tool list. Self-hosted profile changes apply after MCP client confirmation. Cloud runtime mode requires Human CLI approval through the gateway's SQLite approval flow. YAML comments are not retained after a write.
 
-The process explicitly binds all interfaces inside its network-isolated container, while the published host port remains loopback-only. Publish HTTPS through Cloudflare Tunnel, Tailscale, Caddy, or Nginx; `ssh-gateway` intentionally does not terminate public TLS. Do not bake the token or SSH credentials into the image.
+The process explicitly binds all interfaces inside its network-isolated container, while the published host port remains loopback-only. Publish HTTPS through Cloudflare Tunnel, Tailscale, Caddy, or Nginx; `sshmcp` intentionally does not terminate public TLS. Do not bake the token or SSH credentials into the image.
 
-For native Linux, install [the systemd unit](../packaging/systemd/ssh-gateway.service), create `/etc/ssh-gateway/environment` containing `SSH_GATEWAY_MCP_TOKEN=...`, then enable `ssh-gateway.service`. `ssh-gateway serve` runs daemon IPC and MCP against one shared `GatewayService` and session pool.
+For native Linux, install [the systemd unit](../packaging/systemd/sshmcp.service), create `/etc/sshmcp/environment` containing `SSHMCP_MCP_TOKEN=...`, then enable `sshmcp.service`. `sshmcp serve` runs daemon IPC and MCP against one shared `GatewayService` and session pool.
 
 ## Configuration
 
@@ -35,8 +35,8 @@ mcp:
   listen: 127.0.0.1:8765
   auth:
     type: bearer
-    token_env: SSH_GATEWAY_MCP_TOKEN
-  task_id_env: SSH_GATEWAY_TASK_ID
+    token_env: SSHMCP_MCP_TOKEN
+  task_id_env: SSHMCP_TASK_ID
   local_file_root: /data
   allowed_origins:
     - https://gateway.example.com
@@ -46,7 +46,7 @@ mcp:
 
 `task_id_env` is optional, but `propose_plan` requires it and task-scoped grants only match when it is set. `local_file_root` is required for `upload_file` and `download_file`; both local paths must remain below it. `allowed_origins` is checked only when the client sends an `Origin` header.
 
-For official OAuth, put the authorization server in an external OIDC provider such as Auth0, Keycloak, Entra ID, or another provider that issues JWT access tokens and publishes JWKS. `ssh-gateway` validates those tokens and exposes `/.well-known/oauth-protected-resource` for clients that discover resource metadata:
+For official OAuth, put the authorization server in an external OIDC provider such as Auth0, Keycloak, Entra ID, or another provider that issues JWT access tokens and publishes JWKS. `sshmcp` validates those tokens and exposes `/.well-known/oauth-protected-resource` for clients that discover resource metadata:
 
 ```yaml
 mcp:
@@ -56,12 +56,12 @@ mcp:
     resource: https://gateway.example.com
     issuer: https://idp.example.com
     jwks_url: https://idp.example.com/.well-known/jwks.json
-    scopes: [ssh-gateway]
+    scopes: [sshmcp]
   tenants:
     - resource: https://gateway.example.com
       config_path: tenants/main/profiles.yaml
       tenant_id: main
-      local_file_root: /srv/ssh-gateway/main/files
+      local_file_root: /srv/sshmcp/main/files
       profile_management:
         enabled: false
 ```

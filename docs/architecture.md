@@ -13,7 +13,7 @@ CLI / MCP -> Principal -> GatewayService -> Policy / Approval
                                                                     HostKeyVerifier
 ```
 
-The default providers are file backed profiles, file based password/key resolution, SQLite approvals, and JSON audit events on stderr. The provider interfaces are in `src/storage.rs` and `src/audit.rs`. SSH transport has no MCP dependency. The current binary remains `ssh-gateway`.
+The default providers are file backed profiles, file based password/key resolution, SQLite approvals, and JSON audit events on stderr. The provider interfaces are in `src/storage.rs` and `src/audit.rs`. SSH transport has no MCP dependency. The current binary remains `sshmcp`.
 
 The legacy YAML `Profile` is a configuration input and may contain credentials. MCP profile listings and summaries are projected to public metadata. `ResolvedProfile` carries credentials only in the execution path. Self-hosted YAML password and key authentication remain supported.
 

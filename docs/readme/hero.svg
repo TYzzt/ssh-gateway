@@ -1,5 +1,5 @@
 <svg width="1280" height="720" viewBox="0 0 1280 720" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="heroTitle heroDesc">
-  <title id="heroTitle">SSH Gateway for Agents</title>
+  <title id="heroTitle">SSHMCP for Agents</title>
   <desc id="heroDesc">A technical product banner showing an agent request flowing through a daemon and embedded SSH sessions to bastions and targets.</desc>
   <defs>
     <linearGradient id="bg" x1="92" y1="60" x2="1180" y2="658" gradientUnits="userSpaceOnUse">
@@ -40,7 +40,7 @@
   </g>
 
   <text x="110" y="154" fill="#79E7C3" font-size="16" font-family="'Aptos', 'Segoe UI', sans-serif" letter-spacing="0.2em">AGENT-READY REMOTE OPERATIONS</text>
-  <text x="110" y="238" fill="#F5F7FA" font-size="66" font-weight="700" font-family="'Aptos Display', 'Segoe UI', sans-serif">SSH Gateway</text>
+  <text x="110" y="238" fill="#F5F7FA" font-size="66" font-weight="700" font-family="'Aptos Display', 'Segoe UI', sans-serif">SSHMCP</text>
   <text x="110" y="308" fill="#F5F7FA" font-size="66" font-weight="700" font-family="'Aptos Display', 'Segoe UI', sans-serif">for Agents</text>
   <text x="110" y="368" fill="#A7C2D8" font-size="26" font-family="'Aptos', 'Segoe UI', sans-serif">Reusable embedded SSH sessions, bastion chains,</text>
   <text x="110" y="404" fill="#A7C2D8" font-size="26" font-family="'Aptos', 'Segoe UI', sans-serif">delegated hops, and profile-managed credentials.</text>

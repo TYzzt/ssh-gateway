@@ -1,5 +1,5 @@
 <svg width="1280" height="760" viewBox="0 0 1280 760" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="securityTitle securityDesc">
-  <title id="securityTitle">ssh-gateway security boundary</title>
+  <title id="securityTitle">sshmcp security boundary</title>
   <desc id="securityDesc">Security diagram showing that secrets stay in config and daemon boundaries while agents use profile names and receive redacted summaries.</desc>
   <defs>
     <linearGradient id="secBg" x1="74" y1="60" x2="1194" y2="690" gradientUnits="userSpaceOnUse">

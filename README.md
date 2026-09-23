@@ -1,4 +1,9 @@
-# ssh-gateway
+# SSHMCP
+
+Secure remote access for AI agents.
+
+Give agents capabilities, not SSH credentials.
+
 
 Agent policy supports ordered `allow`, `confirm`, and `deny` rules. Confirmed operations persist in SQLite and execute once only through the Human CLI; MCP and `--agent` cannot approve. See [Human approval](docs/approval.md).
 
@@ -9,15 +14,15 @@ Rule-scoped task/time grants and hash-bound ordered Plans reduce repeated confir
 </p>
 
 <p align="center">
-  <img src="docs/readme/hero.svg" alt="SSH Gateway for Agents" width="100%">
+  <img src="docs/readme/hero.svg" alt="SSHMCP for Agents" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/TYzzt/ssh-gateway/releases">
-    <img src="https://img.shields.io/github/v/release/TYzzt/ssh-gateway?display_name=tag&sort=semver" alt="Latest release">
+  <a href="https://github.com/sshmcp/sshmcp/releases">
+    <img src="https://img.shields.io/github/v/release/sshmcp/sshmcp?display_name=tag&sort=semver" alt="Latest release">
   </a>
-  <a href="https://github.com/TYzzt/ssh-gateway/actions/workflows/release.yml">
-    <img src="https://img.shields.io/github/actions/workflow/status/TYzzt/ssh-gateway/release.yml?label=release" alt="Release workflow">
+  <a href="https://github.com/sshmcp/sshmcp/actions/workflows/release.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/sshmcp/sshmcp/release.yml?label=release" alt="Release workflow">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-Apache%202.0-0f766e.svg" alt="Apache 2.0 license">
@@ -25,11 +30,27 @@ Rule-scoped task/time grants and hash-bound ordered Plans reduce repeated confir
   <img src="https://img.shields.io/badge/platforms-Windows%20x64%20%7C%20Linux%20x64-0f172a.svg" alt="Supported platforms">
 </p>
 
-`ssh-gateway` is an agent-facing remote host gateway. It provides reusable embedded SSH sessions, profile-based secret isolation, bastion routing, and policy-controlled remote operations for Codex, ChatGPT, Claude Code, Cursor, and custom agents.
+SSHMCP is the open-source Core and self-hosted gateway. SSHMCP Cloud is a future hosted product. It provides reusable embedded SSH sessions, profile-based secret isolation, bastion routing, and policy-controlled remote operations for Codex, ChatGPT, Claude Code, Cursor, and custom agents.
 
 It is intentionally **not** a general-purpose SSH client replacement. The project is optimized for agent workflows, profile-driven safety, and repeatable remote operations.
 
-## Why ssh-gateway
+## How it works
+
+```text
+ChatGPT · Claude · Codex · Cursor · OpenCode · Custom Agents
+                         | MCP
+                         v
+                      SSHMCP
+       Identity · Policy · Human Approval · Audit
+                  Session Management
+                         | SSH
+                         v
+                    Your Servers
+```
+
+An agent becomes an authenticated Principal. Policy returns Allow, Confirm, or Deny. Confirmed requests require human approval; permitted execution is audited. This is not `LLM -> unrestricted ssh command`. OAuth identity and tenant-aware session isolation prepare the Core for a separate hosted control plane.
+
+## Why SSHMCP
 
 - Agents that repeatedly spawn one-shot `ssh` or `scp` often hit connection churn, login throttling, or refused sessions.
 - Bastion chains, delegated hops, and mixed per-hop auth are awkward to express safely in prompts.
@@ -112,7 +133,7 @@ Remote Agent ------------> MCP Server --------+
 
 Profiles remain location-transparent: direct, bastion, and `via_profile` routing can change without changing Agent calls.
 
-1. Download a release asset from [GitHub Releases](https://github.com/TYzzt/ssh-gateway/releases) and place `ssh-gateway` on your `PATH`.
+1. Download a release asset from [GitHub Releases](https://github.com/sshmcp/sshmcp/releases) and place `sshmcp` on your `PATH`.
 2. Prepare a profile file. YAML is preferred; start from [examples/profiles.yaml](examples/profiles.yaml).
 3. Validate the profile before the first run.
 4. Start the daemon implicitly or explicitly and run remote operations by `profile`.
@@ -120,29 +141,26 @@ Profiles remain location-transparent: direct, bastion, and `via_profile` routing
 PowerShell:
 
 ```powershell
-$env:ARRT_CONFIG_PATH = (Resolve-Path .\examples\profiles.yaml)
-ssh-gateway profile validate
-ssh-gateway daemon start
-ssh-gateway exec --profile direct-with-bastion -- hostname
-ssh-gateway session list
-ssh-gateway daemon stop
+$env:SSHMCP_CONFIG_PATH = (Resolve-Path .\examples\profiles.yaml)
+sshmcp profile validate
+sshmcp daemon start
+sshmcp exec --profile direct-with-bastion -- hostname
+sshmcp session list
+sshmcp daemon stop
 ```
 
 Bash:
 
 ```bash
-export ARRT_CONFIG_PATH="$PWD/examples/profiles.yaml"
-ssh-gateway profile validate
-ssh-gateway daemon start
-ssh-gateway exec --profile direct-with-bastion -- hostname
-ssh-gateway session list
-ssh-gateway daemon stop
+export SSHMCP_CONFIG_PATH="$PWD/examples/profiles.yaml"
+sshmcp profile validate
+sshmcp daemon start
+sshmcp exec --profile direct-with-bastion -- hostname
+sshmcp session list
+sshmcp daemon stop
 ```
 
-The config loader uses `ARRT_CONFIG_PATH` first. If it is unset, the default search order is:
-
-- Windows: `%APPDATA%\opensource\ssh-gateway\profiles.yaml`, then `profiles.yml`, then legacy `profiles.toml`
-- Linux: `$XDG_CONFIG_HOME/opensource/ssh-gateway/profiles.yaml`, then `profiles.yml`, then legacy `profiles.toml`
+The config loader checks `SSHMCP_CONFIG_PATH`, then deprecated `SSH_GATEWAY_CONFIG_PATH` and `ARRT_CONFIG_PATH`. Without an override, it checks `profiles.yaml`, `profiles.yml`, and `profiles.toml` under the new SSHMCP config directory first, then the legacy directory. On Linux the new directory is `$XDG_CONFIG_HOME/sshmcp` (usually `~/.config/sshmcp`); on Windows it is `%APPDATA%\sshmcp\config`. Existing data under the legacy directory remains in use until a new SSHMCP data directory is created. Files are never moved automatically. See [migration guide](docs/migration-from-ssh-gateway.md).
 
 ## Config Examples
 
@@ -248,19 +266,19 @@ Operational commands print JSON. Standard `--help` and `--version` output plain 
 Common examples:
 
 ```text
-ssh-gateway exec --profile delegated-target -- hostname
-ssh-gateway read --profile delegated-target --path /etc/hostname
-ssh-gateway write --profile delegated-target --path /tmp/demo.txt --input hello
-ssh-gateway upload --profile delegated-target --src ./local.txt --dst /tmp/local.txt
-ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
-ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
+sshmcp exec --profile delegated-target -- hostname
+sshmcp read --profile delegated-target --path /etc/hostname
+sshmcp write --profile delegated-target --path /tmp/demo.txt --input hello
+sshmcp upload --profile delegated-target --src ./local.txt --dst /tmp/local.txt
+sshmcp download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
+sshmcp tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
 ```
 
-Local agents add `--agent`, for example `ssh-gateway exec --agent --profile aliyun -- docker ps`. See [Codex setup](docs/codex.md), [ChatGPT MCP setup](docs/chatgpt.md), and [NAS compose deployment](compose.yaml).
+Local agents add `--agent`, for example `sshmcp exec --agent --profile aliyun -- docker ps`. See [Codex setup](docs/codex.md), [ChatGPT MCP setup](docs/chatgpt.md), and [NAS compose deployment](compose.yaml).
 
 ## MCP OAuth and multi-tenant configs
 
-The MCP server keeps the existing static Bearer mode and also supports `oauth_jwt` for official OAuth-style MCP clients. In OAuth mode, `ssh-gateway` acts as a resource server: an external OIDC provider handles login and token issuance, while the gateway validates JWT signature, issuer, expiry, audience/resource, and required scopes.
+The MCP server keeps the existing static Bearer mode and also supports `oauth_jwt` for official OAuth-style MCP clients. In OAuth mode, `sshmcp` acts as a resource server: an external OIDC provider handles login and token issuance, while the gateway validates JWT signature, issuer, expiry, audience/resource, and required scopes.
 
 ```yaml
 mcp:
@@ -270,11 +288,11 @@ mcp:
     resource: https://gateway.example.com
     issuer: https://idp.example.com
     jwks_url: https://idp.example.com/.well-known/jwks.json
-    scopes: [ssh-gateway]
+    scopes: [sshmcp]
   tenants:
     - resource: https://gateway.example.com
       config_path: tenants/main/profiles.yaml
-      local_file_root: /srv/ssh-gateway/main/files
+      local_file_root: /srv/sshmcp/main/files
       profile_management:
         enabled: false
 ```
@@ -285,10 +303,10 @@ Relative local paths are resolved from the CLI caller's current working director
 
 Uploads create remote parent directories and overwrite an existing remote destination. Downloads create local parent directories and atomically replace an existing local destination only after the complete content has been received and synced. Transfer JSON includes the resolved path pair: `local_src`/`remote_dst` for uploads and `remote_src`/`local_dst` for downloads. Download results also include `overwritten`.
 
-Under MSYS2, set `MSYS2_ARG_CONV_EXCL="*"` for transfer commands so MSYS2 does not rewrite remote POSIX paths before `ssh-gateway` receives them:
+Under MSYS2, set `MSYS2_ARG_CONV_EXCL="*"` for transfer commands so MSYS2 does not rewrite remote POSIX paths before `sshmcp` receives them:
 
 ```bash
-MSYS2_ARG_CONV_EXCL="*" ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
+MSYS2_ARG_CONV_EXCL="*" sshmcp download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ```
 
 `daemon stop` returns `{"status":"stopping"}` when it successfully signals a running daemon and `{"status":"not_running"}` when nothing is listening.
@@ -297,57 +315,57 @@ MSYS2_ARG_CONV_EXCL="*" ssh-gateway download --profile delegated-target --src /t
 
 Release assets are published automatically for every pushed `v*` tag.
 
-- Windows x64: `ssh-gateway-<version>-x86_64-pc-windows-msvc.zip`
-- Linux x64: `ssh-gateway-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- Windows x64: `sshmcp-<version>-x86_64-pc-windows-msvc.zip`
+- Linux x64: `sshmcp-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - Checksums: `SHA256SUMS`
 
 Typical install flow:
 
-1. Download the archive for your platform from [Releases](https://github.com/TYzzt/ssh-gateway/releases).
-2. Extract `ssh-gateway` or `ssh-gateway.exe`.
+1. Download the archive for your platform from [Releases](https://github.com/sshmcp/sshmcp/releases).
+2. Extract `sshmcp` or `sshmcp.exe`.
 3. Put the binary on your `PATH`.
 4. Create a config file from [examples/profiles.yaml](examples/profiles.yaml).
 
-For the bundled Windows skill installer, the default target path is `%LOCALAPPDATA%\ssh-gateway\bin\ssh-gateway.exe`. `skills/ssh-gateway/scripts/install.ps1` also persists that directory into the user `PATH` by default, so new shells can resolve `ssh-gateway` without an absolute path.
+For the bundled Windows skill installer, the default target path is `%LOCALAPPDATA%\sshmcp\bin\sshmcp.exe`. `skills/sshmcp/scripts/install.ps1` also persists that directory into the user `PATH` by default, so new shells can resolve `sshmcp` without an absolute path.
 
 ## Install as a Skill
 
-The repository includes a portable `SKILL.md`-based skill at [skills/ssh-gateway](skills/ssh-gateway). The skill is meant for agents that support the open skills ecosystem and teaches them to prefer profile-driven `ssh-gateway` commands over raw `ssh`.
+The repository includes a portable `SKILL.md`-based skill at [skills/sshmcp](skills/sshmcp). The skill is meant for agents that support the open skills ecosystem and teaches them to prefer profile-driven `sshmcp` commands over raw `ssh`.
 
-The skill can also bootstrap the `ssh-gateway` binary on first use by downloading the latest GitHub Release for the current platform. Agents should prefer `ssh-gateway` from `PATH`, then the installer's default target path, and only then reinstall.
+The skill can also bootstrap the `sshmcp` binary on first use by downloading the latest GitHub Release for the current platform. Agents should prefer `sshmcp` from `PATH`, then the installer's default target path, and only then reinstall.
 
 ### Open skills ecosystem
 
 If your agent supports [`npx skills add`](https://github.com/vercel-labs/skills), prefer installing from the direct GitHub path to the skill directory. This avoids repository-root discovery ambiguity on agents or CLI versions that do not consistently resolve nested skills:
 
 ```bash
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -g
 ```
 
 Repository shorthand also works when the CLI discovers nested skills correctly:
 
 ```bash
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -g
+npx skills add sshmcp/sshmcp --skill sshmcp -g
 ```
 
 Examples for common agents:
 
 ```bash
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a codex -g
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a claude-code -g
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a cursor -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -a codex -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -a claude-code -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -a cursor -g
 ```
 
 To inspect what the CLI sees before installing:
 
 ```bash
-npx skills add TYzzt/ssh-gateway --list
+npx skills add sshmcp/sshmcp --list
 ```
 
 To update an existing install that originally came from `npx skills add`:
 
 ```bash
-npx skills update ssh-gateway -g
+npx skills update sshmcp -g
 ```
 
 `npx skills update` does not manage copies installed by the Codex-native `install-skill-from-github.py` script. If you previously installed the skill that way, remove the old copy and reinstall it through `npx skills add` if you want standard `skills` CLI updates later.
@@ -362,22 +380,22 @@ Windows PowerShell:
 
 ```powershell
 py -3 "$env:USERPROFILE\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
-  --repo TYzzt/ssh-gateway `
-  --path skills/ssh-gateway
+  --repo sshmcp/sshmcp `
+  --path skills/sshmcp
 ```
 
 Linux or macOS shell:
 
 ```bash
 python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo TYzzt/ssh-gateway \
-  --path skills/ssh-gateway
+  --repo sshmcp/sshmcp \
+  --path skills/sshmcp
 ```
 
 Notes:
 
 - Restart your agent after installing the skill.
-- If `ssh-gateway` is missing, the bundled skill scripts can download the latest release binary on first use.
+- If `sshmcp` is missing, the bundled skill scripts can download the latest release binary on first use.
 - The skill still expects a valid config file to already exist.
 - The skill is intentionally thin: it does not replace the CLI, it standardizes how the agent should call it.
 - Prefer `npx skills add` when you want a standard install/update workflow across agents.

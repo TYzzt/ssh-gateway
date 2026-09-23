@@ -1,5 +1,5 @@
 <svg width="1280" height="760" viewBox="0 0 1280 760" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="archTitle archDesc">
-  <title id="archTitle">ssh-gateway architecture</title>
+  <title id="archTitle">sshmcp architecture</title>
   <desc id="archDesc">Architecture diagram showing an agent request flowing through CLI and daemon into embedded SSH sessions, bastions, delegated via_profile, and the final target.</desc>
   <defs>
     <linearGradient id="archBg" x1="82" y1="70" x2="1186" y2="684" gradientUnits="userSpaceOnUse">

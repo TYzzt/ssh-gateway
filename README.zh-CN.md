@@ -1,19 +1,24 @@
-# ssh-gateway
+# SSHMCP
+
+为 AI 智能体提供安全的远程访问。
+
+赋予智能体能力，而不是 SSH 凭据。
+
 
 <p align="center">
   <a href="README.md">English</a>
 </p>
 
 <p align="center">
-  <img src="docs/readme/hero.svg" alt="SSH Gateway for Agents" width="100%">
+  <img src="docs/readme/hero.svg" alt="SSHMCP for Agents" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/TYzzt/ssh-gateway/releases">
-    <img src="https://img.shields.io/github/v/release/TYzzt/ssh-gateway?display_name=tag&sort=semver" alt="Latest release">
+  <a href="https://github.com/sshmcp/sshmcp/releases">
+    <img src="https://img.shields.io/github/v/release/sshmcp/sshmcp?display_name=tag&sort=semver" alt="Latest release">
   </a>
-  <a href="https://github.com/TYzzt/ssh-gateway/actions/workflows/release.yml">
-    <img src="https://img.shields.io/github/actions/workflow/status/TYzzt/ssh-gateway/release.yml?label=release" alt="Release workflow">
+  <a href="https://github.com/sshmcp/sshmcp/actions/workflows/release.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/sshmcp/sshmcp/release.yml?label=release" alt="Release workflow">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-Apache%202.0-0f766e.svg" alt="Apache 2.0 license">
@@ -21,11 +26,26 @@
   <img src="https://img.shields.io/badge/platforms-Windows%20x64%20%7C%20Linux%20x64-0f172a.svg" alt="Supported platforms">
 </p>
 
-`ssh-gateway` 是一个面向 Agent 的远程主机网关。它为 Codex、ChatGPT、Claude Code、Cursor 和自研 Agent 提供可复用的 embedded SSH session、profile 密钥隔离、跳板路由和策略控制。
+`sshmcp` 是一个面向 Agent 的远程主机网关。它为 Codex、ChatGPT、Claude Code、Cursor 和自研 Agent 提供可复用的 embedded SSH session、profile 密钥隔离、跳板路由和策略控制。
 
 它刻意**不是**通用 SSH 客户端替代品；项目的重点是 agent 工作流、profile 驱动的安全边界，以及可重复的远程操作接口。
 
-## 为什么需要 ssh-gateway
+## 工作方式
+
+```text
+ChatGPT · Claude · Codex · Cursor · OpenCode · 自定义智能体
+                         | MCP
+                         v
+                      SSHMCP
+         身份 · 策略 · 人工审批 · 审计 · 会话管理
+                         | SSH
+                         v
+                       服务器
+```
+
+智能体先映射为已认证的 Principal，再由策略作出 Allow、Confirm 或 Deny 决策。需要确认的请求必须经人工审批，允许的 SSH 操作会被审计。这不是 `LLM -> unrestricted ssh command`。本仓库是开源 Core 和自托管实现；SSHMCP Cloud 是未来单独提供的托管产品。
+
+## 为什么需要 sshmcp
 
 - 智能体如果频繁起一次性 `ssh` / `scp`，很容易把连接打碎，最终遇到节流、拒绝连接或登录失败。
 - 带跳板机、多跳认证、委托登录这类链路，用 prompt 临时描述既脆弱又不安全。
@@ -87,7 +107,7 @@ MCP 与 CLI 调用会映射为 `Principal`。OAuth JWT 的 `sub` 标识调用者
   <img src="docs/readme/architecture.svg" alt="Agent to daemon to embedded SSH to bastion and target flow" width="100%">
 </p>
 
-1. 从 [GitHub Releases](https://github.com/TYzzt/ssh-gateway/releases) 下载二进制，并把 `ssh-gateway` 放进 `PATH`。
+1. 从 [GitHub Releases](https://github.com/sshmcp/sshmcp/releases) 下载二进制，并把 `sshmcp` 放进 `PATH`。
 2. 准备 profile 配置。推荐 YAML，起点是 [examples/profiles.yaml](examples/profiles.yaml)。
 3. 首次使用前先校验 profile。
 4. 显式或隐式启动 daemon，然后通过 `profile` 执行远端操作。
@@ -95,29 +115,26 @@ MCP 与 CLI 调用会映射为 `Principal`。OAuth JWT 的 `sub` 标识调用者
 PowerShell：
 
 ```powershell
-$env:ARRT_CONFIG_PATH = (Resolve-Path .\examples\profiles.yaml)
-ssh-gateway profile validate
-ssh-gateway daemon start
-ssh-gateway exec --profile direct-with-bastion -- hostname
-ssh-gateway session list
-ssh-gateway daemon stop
+$env:SSHMCP_CONFIG_PATH = (Resolve-Path .\examples\profiles.yaml)
+sshmcp profile validate
+sshmcp daemon start
+sshmcp exec --profile direct-with-bastion -- hostname
+sshmcp session list
+sshmcp daemon stop
 ```
 
 Bash：
 
 ```bash
-export ARRT_CONFIG_PATH="$PWD/examples/profiles.yaml"
-ssh-gateway profile validate
-ssh-gateway daemon start
-ssh-gateway exec --profile direct-with-bastion -- hostname
-ssh-gateway session list
-ssh-gateway daemon stop
+export SSHMCP_CONFIG_PATH="$PWD/examples/profiles.yaml"
+sshmcp profile validate
+sshmcp daemon start
+sshmcp exec --profile direct-with-bastion -- hostname
+sshmcp session list
+sshmcp daemon stop
 ```
 
-配置加载优先级是 `ARRT_CONFIG_PATH` 优先；如果没设置，则默认查找：
-
-- Windows：`%APPDATA%\opensource\ssh-gateway\profiles.yaml`，然后 `profiles.yml`，最后兼容 `profiles.toml`
-- Linux：`$XDG_CONFIG_HOME/opensource/ssh-gateway/profiles.yaml`，然后 `profiles.yml`，最后兼容 `profiles.toml`
+配置优先读取 `SSHMCP_CONFIG_PATH`，然后兼容旧变量 `SSH_GATEWAY_CONFIG_PATH`、`ARRT_CONFIG_PATH`。未指定路径时，先在新 SSHMCP 目录中查找 `profiles.yaml`、`profiles.yml`、`profiles.toml`，再查找旧目录。Linux 新目录是 `$XDG_CONFIG_HOME/sshmcp`（通常为 `~/.config/sshmcp`），Windows 为 `%APPDATA%\sshmcp\config`。旧数据目录仍可回退使用，文件不会被自动迁移。详见[迁移指南](docs/migration-from-ssh-gateway.md)。
 
 ## 配置示例
 
@@ -221,17 +238,17 @@ passphrase = "local-key-passphrase"
 常见示例：
 
 ```text
-ssh-gateway exec --profile delegated-target -- hostname
-ssh-gateway read --profile delegated-target --path /etc/hostname
-ssh-gateway write --profile delegated-target --path /tmp/demo.txt --input hello
-ssh-gateway upload --profile delegated-target --src ./local.txt --dst /tmp/local.txt
-ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
-ssh-gateway tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
+sshmcp exec --profile delegated-target -- hostname
+sshmcp read --profile delegated-target --path /etc/hostname
+sshmcp write --profile delegated-target --path /tmp/demo.txt --input hello
+sshmcp upload --profile delegated-target --src ./local.txt --dst /tmp/local.txt
+sshmcp download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
+sshmcp tunnel open --profile direct-with-bastion --local 8080 --remote 127.0.0.1:11434
 ```
 
 ## MCP OAuth 与多配置隔离
 
-MCP server 保留原有静态 Bearer 模式，同时支持 `oauth_jwt`，用于对接官方 OAuth 风格的 MCP 客户端。OAuth 模式下，`ssh-gateway` 作为 resource server 工作：外部 OIDC 提供方负责登录和签发 token，gateway 负责校验 JWT 签名、issuer、过期时间、audience/resource 和必需 scope。
+MCP server 保留原有静态 Bearer 模式，同时支持 `oauth_jwt`，用于对接官方 OAuth 风格的 MCP 客户端。OAuth 模式下，`sshmcp` 作为 resource server 工作：外部 OIDC 提供方负责登录和签发 token，gateway 负责校验 JWT 签名、issuer、过期时间、audience/resource 和必需 scope。
 
 ```yaml
 mcp:
@@ -241,11 +258,11 @@ mcp:
     resource: https://gateway.example.com
     issuer: https://idp.example.com
     jwks_url: https://idp.example.com/.well-known/jwks.json
-    scopes: [ssh-gateway]
+    scopes: [sshmcp]
   tenants:
     - resource: https://gateway.example.com
       config_path: tenants/main/profiles.yaml
-      local_file_root: /srv/ssh-gateway/main/files
+      local_file_root: /srv/sshmcp/main/files
       profile_management:
         enabled: false
 ```
@@ -256,10 +273,10 @@ mcp:
 
 上传会创建远端父目录并覆盖已有远端目标；下载会创建本地父目录，完整接收并同步内容后再原子替换已有本地目标。传输 JSON 会返回实际路径对：上传为 `local_src`/`remote_dst`，下载为 `remote_src`/`local_dst`；下载还会返回 `overwritten`。
 
-在 MSYS2 下执行传输命令时应设置 `MSYS2_ARG_CONV_EXCL="*"`，避免 MSYS2 在 `ssh-gateway` 接收参数前错误转换远端 POSIX 路径：
+在 MSYS2 下执行传输命令时应设置 `MSYS2_ARG_CONV_EXCL="*"`，避免 MSYS2 在 `sshmcp` 接收参数前错误转换远端 POSIX 路径：
 
 ```bash
-MSYS2_ARG_CONV_EXCL="*" ssh-gateway download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
+MSYS2_ARG_CONV_EXCL="*" sshmcp download --profile delegated-target --src /tmp/local.txt --dst ./local-copy.txt
 ```
 
 `daemon stop` 在成功通知一个正在运行的 daemon 时返回 `{"status":"stopping"}`；如果当前没有 daemon 在监听，则返回 `{"status":"not_running"}`。
@@ -268,57 +285,57 @@ MSYS2_ARG_CONV_EXCL="*" ssh-gateway download --profile delegated-target --src /t
 
 每次推送 `v*` tag 都会自动发布 release 产物。
 
-- Windows x64：`ssh-gateway-<version>-x86_64-pc-windows-msvc.zip`
-- Linux x64：`ssh-gateway-<version>-x86_64-unknown-linux-gnu.tar.gz`
+- Windows x64：`sshmcp-<version>-x86_64-pc-windows-msvc.zip`
+- Linux x64：`sshmcp-<version>-x86_64-unknown-linux-gnu.tar.gz`
 - 校验和：`SHA256SUMS`
 
 典型安装步骤：
 
-1. 从 [Releases](https://github.com/TYzzt/ssh-gateway/releases) 下载适合自己平台的压缩包。
-2. 解压出 `ssh-gateway` 或 `ssh-gateway.exe`。
+1. 从 [Releases](https://github.com/sshmcp/sshmcp/releases) 下载适合自己平台的压缩包。
+2. 解压出 `sshmcp` 或 `sshmcp.exe`。
 3. 把二进制放进 `PATH`。
 4. 基于 [examples/profiles.yaml](examples/profiles.yaml) 准备配置文件。
 
-仓库内置的 Windows skill 安装脚本默认把二进制放到 `%LOCALAPPDATA%\ssh-gateway\bin\ssh-gateway.exe`。`skills/ssh-gateway/scripts/install.ps1` 现在还会默认把这个目录写入用户级 `PATH`，这样新开的 shell 可以直接解析 `ssh-gateway`。
+仓库内置的 Windows skill 安装脚本默认把二进制放到 `%LOCALAPPDATA%\sshmcp\bin\sshmcp.exe`。`skills/sshmcp/scripts/install.ps1` 现在还会默认把这个目录写入用户级 `PATH`，这样新开的 shell 可以直接解析 `sshmcp`。
 
 ## 作为 Skill 安装给智能体
 
-仓库内置了一个可移植的 `SKILL.md` 风格 skill，目录在 [skills/ssh-gateway](skills/ssh-gateway)。它面向支持开放 skills 生态的智能体，职责不是替代 CLI，而是指导 agent 优先走 profile 驱动的 `ssh-gateway` 命令，而不是回退到原始 `ssh`。
+仓库内置了一个可移植的 `SKILL.md` 风格 skill，目录在 [skills/sshmcp](skills/sshmcp)。它面向支持开放 skills 生态的智能体，职责不是替代 CLI，而是指导 agent 优先走 profile 驱动的 `sshmcp` 命令，而不是回退到原始 `ssh`。
 
-这个 skill 还支持在首次使用时自动自举 `ssh-gateway` 二进制：如果本地没有 CLI，可以按当前平台从 GitHub Releases 下载最新版本。agent 侧应优先尝试 `PATH` 中的 `ssh-gateway`，其次尝试安装脚本的默认落盘路径，最后才重新下载安装。
+这个 skill 还支持在首次使用时自动自举 `sshmcp` 二进制：如果本地没有 CLI，可以按当前平台从 GitHub Releases 下载最新版本。agent 侧应优先尝试 `PATH` 中的 `sshmcp`，其次尝试安装脚本的默认落盘路径，最后才重新下载安装。
 
 ### 开放 skills 生态安装
 
 如果目标 agent 支持 [`npx skills add`](https://github.com/vercel-labs/skills)，更推荐直接指向 skill 目录对应的 GitHub 路径安装。这样可以避开部分 agent 或 CLI 版本在“从仓库根发现嵌套 skill”时的不稳定行为：
 
 ```bash
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -g
 ```
 
 如果 CLI 对嵌套 skill 的发现正常，仓库简写也可以用：
 
 ```bash
-npx skills add TYzzt/ssh-gateway --skill ssh-gateway -g
+npx skills add sshmcp/sshmcp --skill sshmcp -g
 ```
 
 常见 agent 示例：
 
 ```bash
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a codex -g
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a claude-code -g
-npx skills add https://github.com/TYzzt/ssh-gateway/tree/main/skills/ssh-gateway -a cursor -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -a codex -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -a claude-code -g
+npx skills add https://github.com/sshmcp/sshmcp/tree/main/skills/sshmcp -a cursor -g
 ```
 
 如果你想先确认 CLI 实际看到了哪些 skill：
 
 ```bash
-npx skills add TYzzt/ssh-gateway --list
+npx skills add sshmcp/sshmcp --list
 ```
 
 如果这份 skill 最初就是通过 `npx skills add` 安装的，后续更新可以直接走：
 
 ```bash
-npx skills update ssh-gateway -g
+npx skills update sshmcp -g
 ```
 
 `npx skills update` 不会接管通过 Codex 原生 `install-skill-from-github.py` 装出来的副本。如果你之前是那条路径安装的，又想以后走标准的 `skills` CLI 更新流程，做法是先删掉旧副本，再改用 `npx skills add` 重新安装。
@@ -333,22 +350,22 @@ Windows PowerShell：
 
 ```powershell
 py -3 "$env:USERPROFILE\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py" `
-  --repo TYzzt/ssh-gateway `
-  --path skills/ssh-gateway
+  --repo sshmcp/sshmcp `
+  --path skills/sshmcp
 ```
 
 Linux / macOS shell：
 
 ```bash
 python ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --repo TYzzt/ssh-gateway \
-  --path skills/ssh-gateway
+  --repo sshmcp/sshmcp \
+  --path skills/sshmcp
 ```
 
 说明：
 
 - 安装完成后需要重启对应的 agent。
-- 如果本地还没有 `ssh-gateway`，skill 自带的脚本可以在首次使用时下载最新 release 二进制。
+- 如果本地还没有 `sshmcp`，skill 自带的脚本可以在首次使用时下载最新 release 二进制。
 - 这个 skill 仍然预期本地已经有可用配置文件。
 - skill 很薄，只负责规范 agent 应该如何调用本项目 CLI。
 - 如果你希望跨 agent 统一安装和更新流程，优先用 `npx skills add`。
