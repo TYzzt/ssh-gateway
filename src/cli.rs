@@ -501,7 +501,7 @@ async fn send_request_with_task(
 
 fn rpc_with_task(request: Request, caller: CallerType, task_id: Option<String>) -> RpcRequest {
     RpcRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: rpc_request_id(),
         caller,
         task_id,
         request,
@@ -555,11 +555,22 @@ pub struct ServeCommand {
 
 fn rpc_with_caller(request: Request, caller: CallerType) -> RpcRequest {
     RpcRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: rpc_request_id(),
         caller,
         task_id: None,
         request,
     }
+}
+
+fn rpc_request_id() -> String {
+    rpc_request_id_from(std::env::var("SSHMCP_REQUEST_ID").ok().as_deref())
+}
+
+fn rpc_request_id_from(value: Option<&str>) -> String {
+    value
+        .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
 fn parse_duration(raw: &str) -> Result<u64, String> {
@@ -740,6 +751,16 @@ fn error_result(err: ArrtError) -> CommandResult {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn rpc_request_id_uses_only_valid_uuid_values() {
+        let expected = uuid::Uuid::new_v4().to_string();
+        assert_eq!(rpc_request_id_from(Some(&expected)), expected);
+
+        let generated = rpc_request_id_from(Some("not-a-uuid"));
+        assert!(uuid::Uuid::parse_str(&generated).is_ok());
+        assert_ne!(generated, "not-a-uuid");
+    }
 
     fn upload(src: &str, dst: &str) -> UploadCommand {
         UploadCommand {
